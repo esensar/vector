@@ -1,15 +1,19 @@
 use std::sync::Arc;
 
 use crate::sinks::Healthcheck;
+use crate::sources::Source;
 use crate::{config::SinkContext, enrichment_tables::memory::Memory};
 use async_trait::async_trait;
 use futures::{future, FutureExt};
 use tokio::sync::Mutex;
-use vector_lib::config::{AcknowledgementsConfig, Input};
+use vector_lib::config::{AcknowledgementsConfig, DataType, Input, LogNamespace};
 use vector_lib::enrichment::Table;
+use vector_lib::schema::{self};
 use vector_lib::{configurable::configurable_component, sink::VectorSink};
+use vrl::path::OwnedTargetPath;
+use vrl::value::Kind;
 
-use crate::config::{EnrichmentTableConfig, SinkConfig};
+use crate::config::{EnrichmentTableConfig, SinkConfig, SourceConfig, SourceContext, SourceOutput};
 
 /// Configuration for the `memory` enrichment table.
 #[configurable_component(enrichment_table("memory"))]
@@ -40,6 +44,16 @@ pub struct MemoryConfig {
     /// By default, there is no size limit.
     #[serde(default = "default_max_byte_size")]
     pub max_byte_size: u64,
+    /// The namespace to use for logs. This overrides the global setting.
+    #[configurable(metadata(docs::hidden))]
+    #[serde(default)]
+    pub log_namespace: Option<bool>,
+    /// Interval for dumping all data from the table when used as a source.
+    ///
+    /// By default, no dumps happen and this table can't be used as a source,
+    /// unless a non-zero dump interval is provided
+    #[serde(default = "default_dump_interval")]
+    pub dump_interval: u64,
 
     #[serde(skip)]
     memory: Arc<Mutex<Option<Box<Memory>>>>,
@@ -62,6 +76,8 @@ impl Default for MemoryConfig {
             flush_interval: default_flush_interval(),
             memory: Arc::new(Mutex::new(None)),
             max_byte_size: default_max_byte_size(),
+            log_namespace: None,
+            dump_interval: default_dump_interval(),
         }
     }
 }
@@ -78,12 +94,17 @@ const fn default_flush_interval() -> u64 {
     0
 }
 
+const fn default_dump_interval() -> u64 {
+    0
+}
+
 const fn default_max_byte_size() -> u64 {
     0
 }
 
 impl MemoryConfig {
-    async fn get_or_build_memory(&self) -> Memory {
+    /// Just pub for now
+    pub async fn get_or_build_memory(&self) -> Memory {
         let mut boxed_memory = self.memory.lock().await;
         *boxed_memory
             .get_or_insert_with(|| Box::new(Memory::new(self.clone())))
@@ -102,6 +123,14 @@ impl EnrichmentTableConfig for MemoryConfig {
     fn sink_config(&self) -> Option<Box<dyn SinkConfig>> {
         Some(Box::new(self.clone()))
     }
+
+    fn source_config(&self) -> Option<Box<dyn SourceConfig>> {
+        if self.dump_interval > 0 {
+            Some(Box::new(self.clone()))
+        } else {
+            None
+        }
+    }
 }
 
 #[async_trait]
@@ -119,6 +148,41 @@ impl SinkConfig for MemoryConfig {
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
         &AcknowledgementsConfig::DEFAULT
+    }
+}
+
+#[async_trait]
+#[typetag::serde(name = "memory_enrichment_table")]
+impl SourceConfig for MemoryConfig {
+    async fn build(&self, cx: SourceContext) -> crate::Result<Source> {
+        let memory = self.get_or_build_memory().await;
+
+        let log_namespace = cx.log_namespace(self.log_namespace);
+
+        Ok(Box::pin(
+            memory.as_source(cx.shutdown, cx.out, log_namespace).run(),
+        ))
+    }
+
+    fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
+        let log_namespace = global_log_namespace.merge(self.log_namespace);
+        let schema_definition = match log_namespace {
+            LogNamespace::Legacy => schema::Definition::default_legacy_namespace(),
+            LogNamespace::Vector => {
+                schema::Definition::new_with_default_metadata(Kind::any_object(), [log_namespace])
+                    .with_meaning(OwnedTargetPath::event_root(), "message")
+            }
+        }
+        .with_standard_vector_source_metadata();
+
+        vec![SourceOutput::new_maybe_logs(
+            DataType::Log,
+            schema_definition,
+        )]
+    }
+
+    fn can_acknowledge(&self) -> bool {
+        false
     }
 }
 

@@ -143,11 +143,17 @@ impl Config {
         self.sinks.get(id)
     }
 
-    pub fn inputs_for_node(&self, id: &ComponentKey) -> Option<&[OutputId]> {
+    pub fn inputs_for_node(&self, id: &ComponentKey) -> Option<Vec<OutputId>> {
         self.transforms
             .get(id)
-            .map(|t| &t.inputs[..])
-            .or_else(|| self.sinks.get(id).map(|s| &s.inputs[..]))
+            .map(|t| t.inputs[..].to_vec())
+            .or_else(|| self.sinks.get(id).map(|s| s.inputs[..].to_vec()))
+            .or_else(|| {
+                self.enrichment_tables
+                    .get(id)
+                    .and_then(|t| t.as_sink())
+                    .map(|s| s.inputs[..].to_vec())
+            })
     }
 
     pub fn propagate_acknowledgements(&mut self) -> Result<(), Vec<String>> {

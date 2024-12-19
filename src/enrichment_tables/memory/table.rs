@@ -390,7 +390,9 @@ impl MemorySource {
                     events = reader
                         .iter()
                         .filter_map(|(k, v)| {
-                            handle.empty(k.clone());
+                            if self.memory.config.remove_after_dump {
+                                handle.empty(k.clone());
+                            }
                             v.get_one().map(|v| (k, v))
                         })
                         .map(|(k, v)| {
@@ -408,9 +410,11 @@ impl MemorySource {
                             event
                         })
                         .collect::<Vec<_>>();
-                    handle.refresh();
-                    let mut metadata = self.memory.metadata.lock().unwrap();
-                    metadata.last_flush = Instant::now();
+                    if self.memory.config.remove_after_dump {
+                        handle.refresh();
+                        let mut metadata = self.memory.metadata.lock().unwrap();
+                        metadata.last_flush = Instant::now();
+                    }
                 }
             }
             let count = events.len();

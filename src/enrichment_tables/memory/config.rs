@@ -57,6 +57,12 @@ pub struct MemoryConfig {
     /// unless a non-zero dump interval is provided
     #[serde(skip_serializing_if = "vector_lib::serde::is_default")]
     pub dump_interval: Option<u64>,
+    /// If set to true, all data will be removed from cache after dumping.
+    /// Only valid if used as a source and dump_interval > 0
+    ///
+    /// By default, dump will not remove data from cache
+    #[serde(default = "crate::serde::default_false")]
+    pub remove_after_dump: bool,
     /// Configuration of internal metrics
     #[configurable(derived)]
     #[serde(default)]
@@ -85,6 +91,7 @@ impl Default for MemoryConfig {
             max_byte_size: None,
             log_namespace: None,
             dump_interval: None,
+            remove_after_dump: false,
             internal_metrics: InternalMetricsConfig::default(),
         }
     }

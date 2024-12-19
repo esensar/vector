@@ -54,6 +54,12 @@ pub struct MemoryConfig {
     /// unless a non-zero dump interval is provided
     #[serde(default = "default_dump_interval")]
     pub dump_interval: u64,
+    /// If set to true, all data will be removed from cache after dumping.
+    /// Only valid if used as a source and dump_interval > 0
+    ///
+    /// By default, dump will not remove data from cache
+    #[serde(default = "crate::serde::default_false")]
+    pub remove_after_dump: bool,
 
     #[serde(skip)]
     memory: Arc<Mutex<Option<Box<Memory>>>>,
@@ -78,6 +84,7 @@ impl Default for MemoryConfig {
             max_byte_size: default_max_byte_size(),
             log_namespace: None,
             dump_interval: default_dump_interval(),
+            remove_after_dump: false,
         }
     }
 }

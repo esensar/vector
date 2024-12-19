@@ -1,13 +1,13 @@
 use std::{
     pin::Pin,
-    task::{ready, Context, Poll},
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use futures::{Stream, StreamExt};
 use metrics::gauge;
 use pin_project::pin_project;
-use tokio::time::interval;
+use tokio::time::{interval, Interval};
 use tokio_stream::wrappers::IntervalStream;
 
 use crate::stats;
@@ -49,15 +49,39 @@ where
         // avoids double-measures.
         let this = self.project();
         loop {
+            // println!("Waiting for timer!");
             this.timer.start_wait();
             match this.intervals.poll_next_unpin(cx) {
                 Poll::Ready(_) => {
+                    //println!("Timer ready, reporting!");
                     this.timer.report();
+                    AsMut::<Interval>::as_mut(this.intervals).reset();
                     continue;
                 }
                 Poll::Pending => {
-                    let result = ready!(this.inner.poll_next_unpin(cx));
+                    //println!("Timer waiting, looking for result!");
+                    let result = match this.inner.poll_next_unpin(cx) {
+                        Poll::Ready(t) => t,
+                        Poll::Pending => match this.intervals.poll_next_unpin(cx) {
+                            Poll::Ready(_) => {
+                                //println!("Timer ready, reporting!");
+                                this.timer.report();
+                                AsMut::<Interval>::as_mut(this.intervals).reset();
+                                continue;
+                            }
+                            Poll::Pending => return Poll::Pending,
+                        },
+                    };
+                    match this.intervals.poll_next_unpin(cx) {
+                        Poll::Ready(_) => {
+                            //println!("Timer ready, reporting!");
+                            this.timer.report();
+                            AsMut::<Interval>::as_mut(this.intervals).reset();
+                        }
+                        Poll::Pending => {}
+                    }
                     this.timer.stop_wait();
+                    //println!("Got result, {:?}", result.is_some());
                     return Poll::Ready(result);
                 }
             }
@@ -72,6 +96,12 @@ where
 /// and the rest of the time it is doing useful work. This is more true for
 /// sinks than transforms, which can be blocked by downstream components, but
 /// with knowledge of the config the data is still useful.
+///
+///
+/// TODO: Replace with some kind of utilization registry and only tell it from here that something
+/// has happened - the registry should handle metrics n stuff
+/// These wrappers should track the time, while that external component should calculate utilization
+/// and publish it
 pub(crate) fn wrap<S>(inner: S) -> Utilization<S> {
     Utilization {
         timer: Timer::new(),
@@ -109,7 +139,9 @@ impl Timer {
 
     /// Begin a new span representing time spent waiting
     pub(crate) fn start_wait(&mut self) {
+        //println!("start_wait");
         if !self.waiting {
+            //println!("was not waiting, now waiting");
             self.end_span();
             self.waiting = true;
         }
@@ -117,8 +149,10 @@ impl Timer {
 
     /// Complete the current waiting span and begin a non-waiting span
     pub(crate) fn stop_wait(&mut self) -> Instant {
+        //println!("stop_wait");
         if self.waiting {
             let now = self.end_span();
+            //println!("was waiting, now ended: {:?}", now);
             self.waiting = false;
             now
         } else {
@@ -141,6 +175,7 @@ impl Timer {
 
         self.ewma.update(utilization);
         let avg = self.ewma.average().unwrap_or(f64::NAN);
+        //println!("AVG: {}", avg);
         debug!(utilization = %avg);
         gauge!("utilization").set(avg);
 
@@ -155,5 +190,50 @@ impl Timer {
         }
         self.span_start = Instant::now();
         self.span_start
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn name() {
+        let (tx, rx) = mpsc::channel::<i32>(1000);
+        let mut rx: Utilization<ReceiverStream<i32>> = wrap(rx.into());
+
+        println!("TEST LOG");
+
+        tokio::spawn(async move {
+            println!("Start tx spawn");
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            println!("Start tx loop");
+            for i in 0..10 {
+                println!("Tx wait: {}", i);
+                tx.send(i).await.unwrap();
+            }
+            println!("End tx loop");
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            println!("Last tx send");
+            tx.send(1).await.unwrap();
+            println!("Last tx send done");
+        });
+
+        tokio::spawn(async move {
+            println!("Start rx spawn");
+            rx.next().await;
+            println!("Start rx loop");
+            for i in 0..200 {
+                println!("Rx wait: {}", i);
+                rx.next().await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            println!("End rx loop");
+        })
+        .await
+        .unwrap();
     }
 }

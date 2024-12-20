@@ -1,21 +1,24 @@
 use std::{
+    collections::HashMap,
     pin::Pin,
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
     time::{Duration, Instant},
 };
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use futures::{Stream, StreamExt};
 use metrics::gauge;
 use pin_project::pin_project;
-use tokio::time::{interval, Interval};
+use tokio::time::interval;
 use tokio_stream::wrappers::IntervalStream;
+use vector_lib::{id::ComponentKey, shutdown::ShutdownSignal};
 
 use crate::stats;
 
 #[pin_project]
 pub(crate) struct Utilization<S> {
-    timer: Timer,
-    intervals: IntervalStream,
+    timer_tx: UnboundedSender<UtilizationTimerMessage>,
+    component_key: ComponentKey,
     inner: S,
 }
 
@@ -42,71 +45,31 @@ where
         // ready, with the side-effect of reporting every so often about how
         // long the wait gap is.
         //
-        // To achieve this we poll the `intervals` stream and if a new interval
-        // is ready we hit `Timer::report` and loop back around again to poll
-        // for a new `Event`. Calls to `Timer::start_wait` will only have an
-        // effect if `stop_wait` has been called, so the structure of this loop
-        // avoids double-measures.
+        // This will just measure the time, while UtilizationEmitter collects
+        // all the timers and emits utilization value periodically
         let this = self.project();
-        loop {
-            // println!("Waiting for timer!");
-            this.timer.start_wait();
-            match this.intervals.poll_next_unpin(cx) {
-                Poll::Ready(_) => {
-                    //println!("Timer ready, reporting!");
-                    this.timer.report();
-                    AsMut::<Interval>::as_mut(this.intervals).reset();
-                    continue;
-                }
-                Poll::Pending => {
-                    //println!("Timer waiting, looking for result!");
-                    let result = match this.inner.poll_next_unpin(cx) {
-                        Poll::Ready(t) => t,
-                        Poll::Pending => match this.intervals.poll_next_unpin(cx) {
-                            Poll::Ready(_) => {
-                                //println!("Timer ready, reporting!");
-                                this.timer.report();
-                                AsMut::<Interval>::as_mut(this.intervals).reset();
-                                continue;
-                            }
-                            Poll::Pending => return Poll::Pending,
-                        },
-                    };
-                    match this.intervals.poll_next_unpin(cx) {
-                        Poll::Ready(_) => {
-                            //println!("Timer ready, reporting!");
-                            this.timer.report();
-                            AsMut::<Interval>::as_mut(this.intervals).reset();
-                        }
-                        Poll::Pending => {}
-                    }
-                    this.timer.stop_wait();
-                    //println!("Got result, {:?}", result.is_some());
-                    return Poll::Ready(result);
-                }
-            }
+        if this
+            .timer_tx
+            .send(UtilizationTimerMessage::StartWait(
+                this.component_key,
+                Instant::now(),
+            ))
+            .is_err()
+        {
+            // Say something?
         }
-    }
-}
-
-/// Wrap a stream to emit stats about utilization. This is designed for use with
-/// the input channels of transform and sinks components, and measures the
-/// amount of time that the stream is waiting for input from upstream. We make
-/// the simplifying assumption that this wait time is when the component is idle
-/// and the rest of the time it is doing useful work. This is more true for
-/// sinks than transforms, which can be blocked by downstream components, but
-/// with knowledge of the config the data is still useful.
-///
-///
-/// TODO: Replace with some kind of utilization registry and only tell it from here that something
-/// has happened - the registry should handle metrics n stuff
-/// These wrappers should track the time, while that external component should calculate utilization
-/// and publish it
-pub(crate) fn wrap<S>(inner: S) -> Utilization<S> {
-    Utilization {
-        timer: Timer::new(),
-        intervals: IntervalStream::new(interval(Duration::from_secs(5))),
-        inner,
+        let result = ready!(this.inner.poll_next_unpin(cx));
+        if this
+            .timer_tx
+            .send(UtilizationTimerMessage::StopWait(
+                this.component_key,
+                Instant::now(),
+            ))
+            .is_err()
+        {
+            // Say something?
+        }
+        return Poll::Ready(result);
     }
 }
 
@@ -138,26 +101,32 @@ impl Timer {
     }
 
     /// Begin a new span representing time spent waiting
-    pub(crate) fn start_wait(&mut self) {
-        //println!("start_wait");
+    pub(crate) fn start_wait_at(&mut self, at: Instant) {
         if !self.waiting {
-            //println!("was not waiting, now waiting");
-            self.end_span();
+            self.end_span(at);
             self.waiting = true;
+        }
+    }
+
+    /// Begin a new span representing time spent waiting
+    pub(crate) fn start_wait(&mut self) {
+        self.start_wait_at(Instant::now())
+    }
+
+    /// Complete the current waiting span and begin a non-waiting span
+    pub(crate) fn stop_wait_at(&mut self, at: Instant) -> Instant {
+        if self.waiting {
+            let now = self.end_span(at);
+            self.waiting = false;
+            now
+        } else {
+            at
         }
     }
 
     /// Complete the current waiting span and begin a non-waiting span
     pub(crate) fn stop_wait(&mut self) -> Instant {
-        //println!("stop_wait");
-        if self.waiting {
-            let now = self.end_span();
-            //println!("was waiting, now ended: {:?}", now);
-            self.waiting = false;
-            now
-        } else {
-            Instant::now()
-        }
+        self.stop_wait_at(Instant::now())
     }
 
     /// Meant to be called on a regular interval, this method calculates wait
@@ -167,7 +136,7 @@ impl Timer {
         // End the current span so it can be accounted for, but do not change
         // whether or not we're in the waiting state. This way the next span
         // inherits the correct status.
-        let now = self.end_span();
+        let now = self.end_span(Instant::now());
 
         let total_duration = now.duration_since(self.overall_start);
         let wait_ratio = self.total_wait.as_secs_f64() / total_duration.as_secs_f64();
@@ -175,7 +144,6 @@ impl Timer {
 
         self.ewma.update(utilization);
         let avg = self.ewma.average().unwrap_or(f64::NAN);
-        //println!("AVG: {}", avg);
         debug!(utilization = %avg);
         gauge!("utilization").set(avg);
 
@@ -184,12 +152,83 @@ impl Timer {
         self.total_wait = Duration::new(0, 0);
     }
 
-    fn end_span(&mut self) -> Instant {
+    fn end_span(&mut self, at: Instant) -> Instant {
         if self.waiting {
-            self.total_wait += self.span_start.elapsed();
+            self.total_wait += at - self.span_start;
         }
-        self.span_start = Instant::now();
+        self.span_start = at;
         self.span_start
+    }
+}
+
+enum UtilizationTimerMessage {
+    StartWait(ComponentKey, Instant),
+    StopWait(ComponentKey, Instant),
+}
+
+struct UtilizationComponent {
+    timer: Timer,
+    receiver: UnboundedReceiver<UtilizationTimerMessage>,
+}
+
+pub(crate) struct UtilizationEmitter {
+    timers: HashMap<ComponentKey, Timer>,
+    timer_rx: UnboundedReceiver<UtilizationTimerMessage>,
+    timer_tx: UnboundedSender<UtilizationTimerMessage>,
+    intervals: IntervalStream,
+}
+
+impl UtilizationEmitter {
+    pub(crate) fn new() -> Self {
+        let (timer_tx, timer_rx) = unbounded_channel();
+        Self {
+            timers: HashMap::default(),
+            intervals: IntervalStream::new(interval(Duration::from_secs(5))),
+            timer_tx,
+            timer_rx,
+        }
+    }
+
+    /// Wrap a stream to emit stats about utilization. This is designed for use with
+    /// the input channels of transform and sinks components, and measures the
+    /// amount of time that the stream is waiting for input from upstream. We make
+    /// the simplifying assumption that this wait time is when the component is idle
+    /// and the rest of the time it is doing useful work. This is more true for
+    /// sinks than transforms, which can be blocked by downstream components, but
+    /// with knowledge of the config the data is still useful.
+    pub(crate) fn wrap<S>(&mut self, key: ComponentKey, inner: S) -> Utilization<S> {
+        self.timers.insert(key, Timer::new());
+        Utilization {
+            timer_tx: self.timer_tx.clone(),
+            component_key: key,
+            inner,
+        }
+    }
+
+    pub(crate) async fn run_utilization(&mut self, mut shutdown: ShutdownSignal) {
+        loop {
+            tokio::select! {
+                message = self.timer_rx.recv() => {
+                    match message {
+                        Some(UtilizationTimerMessage::StartWait(key, start_time)) => {
+                            self.timers[&key].start_wait_at(start_time);
+                        }
+                        Some(UtilizationTimerMessage::StopWait(key, stop_time)) => {
+                            self.timers[&key].stop_wait_at(stop_time);
+                        }
+                        None => break,
+                    }
+                },
+
+                Some(_) = self.intervals.next() => {
+                    for (key, timer) in self.timers {
+                        timer.report();
+                    }
+                },
+
+                _ = &mut shutdown => break,
+            }
+        }
     }
 }
 

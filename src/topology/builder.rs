@@ -51,7 +51,7 @@ use crate::{
     spawn_named,
     topology::task::TaskError,
     transforms::{SyncTransform, TaskTransform, Transform, TransformOutputs, TransformOutputsBuf},
-    utilization::wrap,
+    utilization::{wrap, UtilizationEmitter},
     SourceSender,
 };
 
@@ -84,6 +84,7 @@ struct Builder<'a> {
     healthchecks: HashMap<ComponentKey, Task>,
     detach_triggers: HashMap<ComponentKey, Trigger>,
     extra_context: ExtraContext,
+    utilization_emitter: UtilizationEmitter,
 }
 
 impl<'a> Builder<'a> {
@@ -105,6 +106,7 @@ impl<'a> Builder<'a> {
             healthchecks: HashMap::new(),
             detach_triggers: HashMap::new(),
             extra_context,
+            utilization_emitter: UtilizationEmitter::new(),
         }
     }
 
@@ -128,6 +130,7 @@ impl<'a> Builder<'a> {
                 healthchecks: self.healthchecks,
                 shutdown_coordinator: self.shutdown_coordinator,
                 detach_triggers: self.detach_triggers,
+                utilization_emitter: self.utilization_emitter,
             })
         } else {
             Err(self.errors)
@@ -600,7 +603,7 @@ impl<'a> Builder<'a> {
                     .take()
                     .expect("Task started but input has been taken.");
 
-                let mut rx = wrap(rx);
+                let mut rx = self.utilization_emitter.wrap(key.clone(), rx);
 
                 let events_received = register!(EventsReceived);
                 sink.run(
@@ -682,6 +685,7 @@ pub struct TopologyPieces {
     pub(super) healthchecks: HashMap<ComponentKey, Task>,
     pub(crate) shutdown_coordinator: SourceShutdownCoordinator,
     pub(crate) detach_triggers: HashMap<ComponentKey, Trigger>,
+    pub(crate) utilization_emitter: UtilizationEmitter,
 }
 
 impl TopologyPieces {

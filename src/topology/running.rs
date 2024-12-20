@@ -21,6 +21,7 @@ use crate::{
     shutdown::SourceShutdownCoordinator,
     signal::ShutdownError,
     spawn_named,
+    utilization::UtilizationEmitter,
 };
 use futures::{future, Future, FutureExt};
 use tokio::{
@@ -49,6 +50,7 @@ pub struct RunningTopology {
     watch: (WatchTx, WatchRx),
     pub(crate) running: Arc<AtomicBool>,
     graceful_shutdown_duration: Option<Duration>,
+    utilization_emitter: UtilizationEmitter,
 }
 
 impl RunningTopology {
@@ -67,6 +69,7 @@ impl RunningTopology {
             running: Arc::new(AtomicBool::new(true)),
             graceful_shutdown_duration: config.graceful_shutdown_duration,
             config,
+            utilization_emitter: UtilizationEmitter::new(),
         }
     }
 

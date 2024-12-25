@@ -1,4 +1,4 @@
-use std::num::NonZeroU64;
+use std::net::SocketAddr;
 
 use snafu::ResultExt;
 use vector_lib::codecs::JsonSerializerConfig;
@@ -25,6 +25,8 @@ pub struct WebSocketSinkConfig {
     /// The socket address to listen for connections on.
     ///
     /// It _must_ include a port.
+    #[configurable(metadata(docs::examples = "0.0.0.0:80"))]
+    #[configurable(metadata(docs::examples = "localhost:80"))]
     pub address: SocketAddr,
 
     #[configurable(derived)]
@@ -48,11 +50,9 @@ pub struct WebSocketSinkConfig {
 impl GenerateConfig for WebSocketSinkConfig {
     fn generate_config() -> toml::Value {
         toml::Value::try_from(Self {
-            uri: "ws://127.0.0.1:9000/endpoint".into(),
+            address: "0.0.0.0:8080".into(),
             tls: None,
             encoding: JsonSerializerConfig::default().into(),
-            ping_interval: None,
-            ping_timeout: None,
             acknowledgements: Default::default(),
             auth: None,
         })

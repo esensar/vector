@@ -586,7 +586,7 @@ impl RunningTopology {
         for key in &removed_sinks {
             let previous = self
                 .tasks
-                .remove(&(key.clone(), "sink".to_string()))
+                .remove(&((*key).clone(), "sink".to_string()))
                 .unwrap();
             if wait_for_sinks.contains(key) {
                 debug!(message = "Waiting for sink to shutdown.", %key);
@@ -601,7 +601,7 @@ impl RunningTopology {
             if wait_for_sinks.contains(key) {
                 let previous = self
                     .tasks
-                    .remove(&(key.clone(), "sink".to_string()))
+                    .remove(&((*key).clone(), "sink".to_string()))
                     .unwrap();
                 debug!(message = "Waiting for sink to shutdown.", %key);
                 let buffer = previous.await.unwrap().unwrap();
@@ -828,6 +828,7 @@ impl RunningTopology {
             .inputs_for_node(key)
             .into_iter()
             .flatten()
+            .cloned()
             .collect::<HashSet<_>>();
 
         let new_inputs = inputs.iter().cloned().collect::<HashSet<_>>();

@@ -924,7 +924,7 @@ mod tests {
         let mut memory_config = MemoryConfig::default();
         memory_config.dump_interval = 1;
         let mut memory = memory_config.get_or_build_memory().await;
-        memory.handle_value(&ObjectMap::from([("test_key".into(), Value::from(5))]));
+        memory.handle_value(ObjectMap::from([("test_key".into(), Value::from(5))]));
 
         let mut events: Vec<Event> = run_and_assert_source_compliance(
             memory_config,

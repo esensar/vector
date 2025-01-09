@@ -395,9 +395,9 @@ impl MemorySource {
                             }
                             v.get_one().map(|v| (k, v))
                         })
-                        .map(|(k, v)| {
+                        .filter_map(|(k, v)| {
                             let mut event = Event::Log(LogEvent::from_map(
-                                v.as_object_map(now, self.memory.config.ttl, k),
+                                v.as_object_map(now, self.memory.config.ttl, k).ok()?,
                                 EventMetadata::default(),
                             ));
                             let log = event.as_mut_log();
@@ -407,7 +407,7 @@ impl MemorySource {
                                 utc_now,
                             );
 
-                            event
+                            Some(event)
                         })
                         .collect::<Vec<_>>();
                     if self.memory.config.remove_after_dump {

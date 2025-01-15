@@ -218,6 +218,7 @@ impl Memory {
             shutdown,
             out,
             log_namespace,
+            dump_batch_size: self.config.dump_batch_size as usize,
         }
     }
 }
@@ -369,6 +370,7 @@ pub struct MemorySource {
     shutdown: ShutdownSignal,
     out: SourceSender,
     log_namespace: LogNamespace,
+    dump_batch_size: usize,
 }
 
 impl MemorySource {
@@ -381,49 +383,60 @@ impl MemorySource {
         .take_until(self.shutdown);
 
         while interval.next().await.is_some() {
-            let mut events = Vec::new();
-            {
-                let mut handle = self.memory.write_handle.lock().unwrap();
-                if let Some(reader) = self.memory.get_read_handle().read() {
-                    let now = Instant::now();
-                    let utc_now = Utc::now();
-                    events = reader
-                        .iter()
-                        .filter_map(|(k, v)| {
-                            if self.memory.config.remove_after_dump {
-                                handle.empty(k.clone());
-                            }
-                            v.get_one().map(|v| (k, v))
-                        })
-                        .filter_map(|(k, v)| {
-                            let mut event = Event::Log(LogEvent::from_map(
-                                v.as_object_map(now, self.memory.config.ttl, k).ok()?,
-                                EventMetadata::default(),
-                            ));
-                            let log = event.as_mut_log();
-                            self.log_namespace.insert_standard_vector_source_metadata(
-                                log,
-                                MemoryConfig::NAME,
-                                utc_now,
-                            );
+            loop {
+                let mut events = Vec::new();
+                {
+                    let mut handle = self.memory.write_handle.lock().unwrap();
+                    if let Some(reader) = self.memory.get_read_handle().read() {
+                        let now = Instant::now();
+                        let utc_now = Utc::now();
+                        events = reader
+                            .iter()
+                            .take(if self.dump_batch_size == 0 {
+                                usize::MAX
+                            } else {
+                                self.dump_batch_size
+                            })
+                            .filter_map(|(k, v)| {
+                                if self.memory.config.remove_after_dump {
+                                    handle.empty(k.clone());
+                                }
+                                v.get_one().map(|v| (k, v))
+                            })
+                            .filter_map(|(k, v)| {
+                                let mut event = Event::Log(LogEvent::from_map(
+                                    v.as_object_map(now, self.memory.config.ttl, k).ok()?,
+                                    EventMetadata::default(),
+                                ));
+                                let log = event.as_mut_log();
+                                self.log_namespace.insert_standard_vector_source_metadata(
+                                    log,
+                                    MemoryConfig::NAME,
+                                    utc_now,
+                                );
 
-                            Some(event)
-                        })
-                        .collect::<Vec<_>>();
-                    if self.memory.config.remove_after_dump {
-                        handle.refresh();
-                        let mut metadata = self.memory.metadata.lock().unwrap();
-                        metadata.last_flush = Instant::now();
+                                Some(event)
+                            })
+                            .collect::<Vec<_>>();
+                        if self.memory.config.remove_after_dump {
+                            handle.refresh();
+                            let mut metadata = self.memory.metadata.lock().unwrap();
+                            metadata.last_flush = Instant::now();
+                        }
                     }
                 }
-            }
-            let count = events.len();
-            let byte_size = events.size_of();
-            let json_size = events.estimated_json_encoded_size_of();
-            bytes_received.emit(ByteSize(byte_size));
-            events_received.emit(CountByteSize(count, json_size));
-            if self.out.send_batch(events).await.is_err() {
-                emit!(StreamClosedError { count });
+                let count = events.len();
+                let byte_size = events.size_of();
+                let json_size = events.estimated_json_encoded_size_of();
+                bytes_received.emit(ByteSize(byte_size));
+                events_received.emit(CountByteSize(count, json_size));
+                if self.out.send_batch(events).await.is_err() {
+                    emit!(StreamClosedError { count });
+                }
+
+                if self.dump_batch_size == 0 || count < self.dump_batch_size {
+                    break;
+                }
             }
         }
 

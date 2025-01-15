@@ -57,6 +57,12 @@ pub struct MemoryConfig {
     /// unless a non-zero dump interval is provided
     #[serde(skip_serializing_if = "vector_lib::serde::is_default")]
     pub dump_interval: Option<u64>,
+    /// Batch size for data dumping. Used to prevent dumping entire table at
+    /// once and blocking the system.
+    ///
+    /// By default, batches are not used and entire table is dumped.
+    #[serde(skip_serializing_if = "vector_lib::serde::is_default")]
+    pub dump_batch_size: Option<u64>,
     /// If set to true, all data will be removed from cache after dumping.
     /// Only valid if used as a source and dump_interval > 0
     ///
@@ -91,6 +97,7 @@ impl Default for MemoryConfig {
             max_byte_size: None,
             log_namespace: None,
             dump_interval: None,
+            dump_batch_size: None,
             remove_after_dump: false,
             internal_metrics: InternalMetricsConfig::default(),
         }

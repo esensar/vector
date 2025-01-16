@@ -383,15 +383,21 @@ impl MemorySource {
         .take_until(self.shutdown);
 
         while interval.next().await.is_some() {
+            let mut sent = 0 as usize;
             loop {
                 let mut events = Vec::new();
                 {
-                    let mut handle = self.memory.write_handle.lock().unwrap();
+                    let mut writer = self.memory.write_handle.lock().unwrap();
                     if let Some(reader) = self.memory.get_read_handle().read() {
                         let now = Instant::now();
                         let utc_now = Utc::now();
                         events = reader
                             .iter()
+                            .skip(if self.memory.config.remove_after_dump {
+                                0
+                            } else {
+                                sent
+                            })
                             .take(if self.dump_batch_size == 0 {
                                 usize::MAX
                             } else {
@@ -399,7 +405,7 @@ impl MemorySource {
                             })
                             .filter_map(|(k, v)| {
                                 if self.memory.config.remove_after_dump {
-                                    handle.empty(k.clone());
+                                    writer.write_handle.empty(k.clone());
                                 }
                                 v.get_one().map(|v| (k, v))
                             })
@@ -419,9 +425,7 @@ impl MemorySource {
                             })
                             .collect::<Vec<_>>();
                         if self.memory.config.remove_after_dump {
-                            handle.refresh();
-                            let mut metadata = self.memory.metadata.lock().unwrap();
-                            metadata.last_flush = Instant::now();
+                            writer.write_handle.refresh();
                         }
                     }
                 }
@@ -434,6 +438,7 @@ impl MemorySource {
                     emit!(StreamClosedError { count });
                 }
 
+                sent += count;
                 if self.dump_batch_size == 0 || count < self.dump_batch_size {
                     break;
                 }

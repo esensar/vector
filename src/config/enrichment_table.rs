@@ -7,7 +7,7 @@ use vector_lib::id::Inputs;
 use crate::enrichment_tables::EnrichmentTables;
 
 use super::dot_graph::GraphConfig;
-use super::{SinkConfig, SinkOuter};
+use super::{SinkConfig, SinkOuter, SourceConfig, SourceOuter};
 
 /// Fully resolved enrichment table component.
 #[configurable_component]
@@ -69,6 +69,15 @@ where
         })
     }
 
+    pub fn as_source(&self) -> Option<SourceOuter> {
+        self.inner.source_config().map(|source| SourceOuter {
+            graph: self.graph.clone(),
+            sink_acknowledgements: false,
+            proxy: Default::default(),
+            inner: source,
+        })
+    }
+
     pub(super) fn map_inputs<U>(self, f: impl Fn(&T) -> U) -> EnrichmentTableOuter<U>
     where
         U: Configurable + Serialize + 'static + ToValue + Clone,
@@ -108,6 +117,10 @@ pub trait EnrichmentTableConfig: NamedComponent + core::fmt::Debug + Send + Sync
     ) -> crate::Result<Box<dyn vector_lib::enrichment::Table + Send + Sync>>;
 
     fn sink_config(&self) -> Option<Box<dyn SinkConfig>> {
+        None
+    }
+
+    fn source_config(&self) -> Option<Box<dyn SourceConfig>> {
         None
     }
 }

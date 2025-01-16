@@ -78,7 +78,7 @@ struct Builder<'a> {
     shutdown_coordinator: SourceShutdownCoordinator,
     errors: Vec<String>,
     outputs: HashMap<OutputId, UnboundedSender<fanout::ControlMessage>>,
-    tasks: HashMap<ComponentKey, Task>,
+    tasks: HashMap<(ComponentKey, String), Task>,
     buffers: HashMap<ComponentKey, BuiltBuffer>,
     inputs: HashMap<ComponentKey, (BufferSender<EventArray>, Inputs<OutputId>)>,
     healthchecks: HashMap<ComponentKey, Task>,
@@ -206,10 +206,22 @@ impl<'a> Builder<'a> {
     async fn build_sources(&mut self) -> HashMap<ComponentKey, Task> {
         let mut source_tasks = HashMap::new();
 
+        let table_sources = self
+            .config
+            .enrichment_tables
+            .iter()
+            .filter_map(|(key, table)| table.as_source().map(|s| (key, s)))
+            .collect::<Vec<_>>();
         for (key, source) in self
             .config
             .sources()
             .filter(|(key, _)| self.diff.sources.contains_new(key))
+            .chain(
+                table_sources
+                    .iter()
+                    .map(|(key, source)| (*key, source))
+                    .filter(|(key, _)| self.diff.enrichment_tables.contains_new(key)),
+            )
         {
             debug!(component = %key, "Building new source.");
 
@@ -392,7 +404,7 @@ impl<'a> Builder<'a> {
             let server = Task::new(key.clone(), typetag, server);
 
             self.outputs.extend(controls);
-            self.tasks.insert(key.clone(), pump);
+            self.tasks.insert((key.clone(), "source".to_string()), pump);
             source_tasks.insert(key.clone(), server);
         }
 
@@ -501,7 +513,8 @@ impl<'a> Builder<'a> {
             };
 
             self.outputs.extend(transform_outputs);
-            self.tasks.insert(key.clone(), transform_task);
+            self.tasks
+                .insert((key.clone(), "transform".to_string()), transform_task);
         }
     }
 
@@ -680,7 +693,7 @@ impl<'a> Builder<'a> {
 
             self.inputs.insert(key.clone(), (tx, sink_inputs.clone()));
             self.healthchecks.insert(key.clone(), healthcheck_task);
-            self.tasks.insert(key.clone(), task);
+            self.tasks.insert((key.clone(), "sink".to_string()), task);
             self.detach_triggers.insert(key.clone(), trigger);
         }
     }
@@ -689,7 +702,7 @@ impl<'a> Builder<'a> {
 pub struct TopologyPieces {
     pub(super) inputs: HashMap<ComponentKey, (BufferSender<EventArray>, Inputs<OutputId>)>,
     pub(crate) outputs: HashMap<ComponentKey, HashMap<Option<String>, fanout::ControlChannel>>,
-    pub(super) tasks: HashMap<ComponentKey, Task>,
+    pub(super) tasks: HashMap<(ComponentKey, String), Task>,
     pub(crate) source_tasks: HashMap<ComponentKey, Task>,
     pub(super) healthchecks: HashMap<ComponentKey, Task>,
     pub(crate) shutdown_coordinator: SourceShutdownCoordinator,

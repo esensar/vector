@@ -61,8 +61,17 @@ pub fn compile(mut builder: ConfigBuilder) -> Result<(Config, Vec<String>), Vec<
                 .filter_map(|(key, table)| table.as_sink().map(|s| (key.clone(), s))),
         )
         .collect::<IndexMap<_, _>>();
+    let sources_and_table_sources = sources
+        .clone()
+        .into_iter()
+        .chain(
+            enrichment_tables
+                .iter()
+                .filter_map(|(key, table)| table.as_source().map(|s| (key.clone(), s))),
+        )
+        .collect::<IndexMap<_, _>>();
 
-    let graph = match Graph::new(&sources, &transforms, &all_sinks, schema) {
+    let graph = match Graph::new(&sources_and_table_sources, &transforms, &all_sinks, schema) {
         Ok(graph) => graph,
         Err(graph_errors) => {
             errors.extend(graph_errors);

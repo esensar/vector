@@ -44,7 +44,7 @@ pub struct RunningTopology {
     outputs: HashMap<OutputId, ControlChannel>,
     outputs_tap_metadata: HashMap<ComponentKey, (&'static str, String)>,
     source_tasks: HashMap<ComponentKey, TaskHandle>,
-    tasks: HashMap<ComponentKey, TaskHandle>,
+    tasks: HashMap<(ComponentKey, String), TaskHandle>,
     shutdown_coordinator: SourceShutdownCoordinator,
     detach_triggers: HashMap<ComponentKey, DisabledTrigger>,
     pub(crate) config: Config,
@@ -121,11 +121,15 @@ impl RunningTopology {
 
         // We need to give some time to the sources to gracefully shutdown, so
         // we will merge them with other tasks.
-        for (key, task) in self.tasks.into_iter().chain(self.source_tasks.into_iter()) {
+        for (key, task) in self.tasks.into_iter().chain(
+            self.source_tasks
+                .into_iter()
+                .map(|(k, j)| ((k, "source".to_string()), j)),
+        ) {
             let task = task.map(|_result| ()).shared();
 
             wait_handles.push(task.clone());
-            check_handles.entry(key).or_default().push(task);
+            check_handles.entry(key.0).or_default().push(task);
         }
 
         // If we reach this, we will forcefully shutdown the sources. If None, we will never force shutdown.
@@ -360,7 +364,10 @@ impl RunningTopology {
             for key in &diff.sources.to_remove {
                 debug!(component = %key, "Removing source.");
 
-                let previous = self.tasks.remove(key).unwrap();
+                let previous = self
+                    .tasks
+                    .remove(&(key.clone(), "source".to_string()))
+                    .unwrap();
                 drop(previous); // detach and forget
 
                 self.remove_outputs(key);
@@ -400,7 +407,10 @@ impl RunningTopology {
         for key in &diff.transforms.to_remove {
             debug!(component = %key, "Removing transform.");
 
-            let previous = self.tasks.remove(key).unwrap();
+            let previous = self
+                .tasks
+                .remove(&(key.clone(), "transform".to_string()))
+                .unwrap();
             drop(previous); // detach and forget
 
             self.remove_inputs(key, diff, new_config).await;
@@ -574,7 +584,10 @@ impl RunningTopology {
         // If a sink we're removing isn't tying up any resource that a changed/added sink depends
         // on, we don't bother waiting for it to shutdown.
         for key in &removed_sinks {
-            let previous = self.tasks.remove(key).unwrap();
+            let previous = self
+                .tasks
+                .remove(&(key.clone(), "sink".to_string()))
+                .unwrap();
             if wait_for_sinks.contains(key) {
                 debug!(message = "Waiting for sink to shutdown.", %key);
                 previous.await.unwrap().unwrap();
@@ -586,7 +599,10 @@ impl RunningTopology {
         let mut buffers = HashMap::<ComponentKey, BuiltBuffer>::new();
         for key in &sinks_to_change {
             if wait_for_sinks.contains(key) {
-                let previous = self.tasks.remove(key).unwrap();
+                let previous = self
+                    .tasks
+                    .remove(&(key.clone(), "sink".to_string()))
+                    .unwrap();
                 debug!(message = "Waiting for sink to shutdown.", %key);
                 let buffer = previous.await.unwrap().unwrap();
 
@@ -650,14 +666,17 @@ impl RunningTopology {
             }
 
             for key in diff.sources.changed_and_added() {
-                if let Some(task) = new_pieces.tasks.get(key) {
+                if let Some(task) = new_pieces.tasks.get(&(key.clone(), "source".to_string())) {
                     self.outputs_tap_metadata
                         .insert(key.clone(), ("source", task.typetag().to_string()));
                 }
             }
 
             for key in diff.transforms.changed_and_added() {
-                if let Some(task) = new_pieces.tasks.get(key) {
+                if let Some(task) = new_pieces
+                    .tasks
+                    .get(&(key.clone(), "transform".to_string()))
+                {
                     self.outputs_tap_metadata
                         .insert(key.clone(), ("transform", task.typetag().to_string()));
                 }
@@ -673,6 +692,16 @@ impl RunningTopology {
         // transforms and sinks that come afterwards.
         for key in diff.sources.changed_and_added() {
             debug!(component = %key, "Configuring outputs for source.");
+            self.setup_outputs(key, new_pieces).await;
+        }
+
+        let added_changed_table_sources: Vec<&ComponentKey> = diff
+            .enrichment_tables
+            .changed_and_added()
+            .filter(|k| new_pieces.source_tasks.contains_key(k))
+            .collect();
+        for key in added_changed_table_sources {
+            debug!(component = %key, "Connecting outputs for enrichment table source.");
             self.setup_outputs(key, new_pieces).await;
         }
 
@@ -698,7 +727,11 @@ impl RunningTopology {
         let added_changed_tables: Vec<&ComponentKey> = diff
             .enrichment_tables
             .changed_and_added()
-            .filter(|k| new_pieces.tasks.contains_key(k))
+            .filter(|k| {
+                new_pieces
+                    .tasks
+                    .contains_key(&((*k).clone(), "sink".to_string()))
+            })
             .collect();
         for key in added_changed_tables {
             debug!(component = %key, "Connecting inputs for enrichment table sink.");
@@ -795,7 +828,6 @@ impl RunningTopology {
             .inputs_for_node(key)
             .into_iter()
             .flatten()
-            .cloned()
             .collect::<HashSet<_>>();
 
         let new_inputs = inputs.iter().cloned().collect::<HashSet<_>>();
@@ -838,17 +870,14 @@ impl RunningTopology {
         self.detach_triggers.remove(key);
 
         let old_inputs = self.config.inputs_for_node(key).expect("node exists");
-        let new_inputs = new_config
-            .inputs_for_node(key)
-            .unwrap_or_default()
-            .iter()
-            .collect::<HashSet<_>>();
+        let new_inputs_temp = new_config.inputs_for_node(key).unwrap_or_default();
+        let new_inputs = new_inputs_temp.iter().collect::<HashSet<_>>();
 
         for input in old_inputs {
-            if let Some(output) = self.outputs.get_mut(input) {
+            if let Some(output) = self.outputs.get_mut(&input) {
                 if diff.contains(&input.component)
                     || diff.is_removed(key)
-                    || !new_inputs.contains(input)
+                    || !new_inputs.contains(&input)
                 {
                     // 3 cases to remove the input:
                     //
@@ -919,6 +948,30 @@ impl RunningTopology {
             self.spawn_source(key, &mut new_pieces);
         }
 
+        let changed_table_sources: Vec<&ComponentKey> = diff
+            .enrichment_tables
+            .to_change
+            .iter()
+            .filter(|k| new_pieces.source_tasks.contains_key(k))
+            .collect();
+
+        let added_table_sources: Vec<&ComponentKey> = diff
+            .enrichment_tables
+            .to_add
+            .iter()
+            .filter(|k| new_pieces.source_tasks.contains_key(k))
+            .collect();
+
+        for key in changed_table_sources {
+            debug!(message = "Spawning changed enrichment table source.", key = %key);
+            self.spawn_source(key, &mut new_pieces);
+        }
+
+        for key in added_table_sources {
+            debug!(message = "Spawning new enrichment table source.", key = %key);
+            self.spawn_source(key, &mut new_pieces);
+        }
+
         for key in &diff.transforms.to_change {
             debug!(message = "Spawning changed transform.", key = %key);
             self.spawn_transform(key, &mut new_pieces);
@@ -943,14 +996,22 @@ impl RunningTopology {
             .enrichment_tables
             .to_change
             .iter()
-            .filter(|k| new_pieces.tasks.contains_key(k))
+            .filter(|k| {
+                new_pieces
+                    .tasks
+                    .contains_key(&((*k).clone(), "sink".to_string()))
+            })
             .collect();
 
         let added_tables: Vec<&ComponentKey> = diff
             .enrichment_tables
             .to_add
             .iter()
-            .filter(|k| new_pieces.tasks.contains_key(k))
+            .filter(|k| {
+                new_pieces
+                    .tasks
+                    .contains_key(&((*k).clone(), "sink".to_string()))
+            })
             .collect();
 
         for key in changed_tables {
@@ -965,7 +1026,10 @@ impl RunningTopology {
     }
 
     fn spawn_sink(&mut self, key: &ComponentKey, new_pieces: &mut builder::TopologyPieces) {
-        let task = new_pieces.tasks.remove(key).unwrap();
+        let task = new_pieces
+            .tasks
+            .remove(&(key.clone(), "sink".to_string()))
+            .unwrap();
         let span = error_span!(
             "sink",
             component_kind = "sink",
@@ -1000,13 +1064,19 @@ impl RunningTopology {
         }
         .instrument(task_span);
         let spawned = spawn_named(task, task_name.as_ref());
-        if let Some(previous) = self.tasks.insert(key.clone(), spawned) {
+        if let Some(previous) = self
+            .tasks
+            .insert((key.clone(), "sink".to_string()), spawned)
+        {
             drop(previous); // detach and forget
         }
     }
 
     fn spawn_transform(&mut self, key: &ComponentKey, new_pieces: &mut builder::TopologyPieces) {
-        let task = new_pieces.tasks.remove(key).unwrap();
+        let task = new_pieces
+            .tasks
+            .remove(&(key.clone(), "transform".to_string()))
+            .unwrap();
         let span = error_span!(
             "transform",
             component_kind = "transform",
@@ -1041,13 +1111,19 @@ impl RunningTopology {
         }
         .instrument(task_span);
         let spawned = spawn_named(task, task_name.as_ref());
-        if let Some(previous) = self.tasks.insert(key.clone(), spawned) {
+        if let Some(previous) = self
+            .tasks
+            .insert((key.clone(), "transform".to_string()), spawned)
+        {
             drop(previous); // detach and forget
         }
     }
 
     fn spawn_source(&mut self, key: &ComponentKey, new_pieces: &mut builder::TopologyPieces) {
-        let task = new_pieces.tasks.remove(key).unwrap();
+        let task = new_pieces
+            .tasks
+            .remove(&(key.clone(), "source".to_string()))
+            .unwrap();
         let span = error_span!(
             "source",
             component_kind = "source",
@@ -1083,7 +1159,10 @@ impl RunningTopology {
         }
         .instrument(task_span.clone());
         let spawned = spawn_named(task, task_name.as_ref());
-        if let Some(previous) = self.tasks.insert(key.clone(), spawned) {
+        if let Some(previous) = self
+            .tasks
+            .insert((key.clone(), "source".to_string()), spawned)
+        {
             drop(previous); // detach and forget
         }
 

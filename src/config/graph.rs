@@ -55,7 +55,7 @@ struct Edge {
 
 #[derive(Default)]
 pub struct Graph {
-    nodes: HashMap<ComponentKey, Node>,
+    nodes: HashMap<ComponentKey, Vec<Node>>,
     edges: Vec<Edge>,
 }
 
@@ -90,35 +90,34 @@ impl Graph {
 
         // First, insert all of the different node types
         for (id, config) in sources.iter() {
-            graph.nodes.insert(
-                id.clone(),
-                Node::Source {
+            graph
+                .nodes
+                .entry(id.clone())
+                .or_default()
+                .push(Node::Source {
                     outputs: config.inner.outputs(schema.log_namespace()),
-                },
-            );
+                });
         }
 
         for (id, transform) in transforms.iter() {
-            graph.nodes.insert(
-                id.clone(),
-                Node::Transform {
+            graph
+                .nodes
+                .entry(id.clone())
+                .or_default()
+                .push(Node::Transform {
                     in_ty: transform.inner.input().data_type(),
                     outputs: transform.inner.outputs(
                         vector_lib::enrichment::TableRegistry::default(),
                         &[(id.into(), schema::Definition::any())],
                         schema.log_namespace(),
                     ),
-                },
-            );
+                });
         }
 
         for (id, config) in sinks {
-            graph.nodes.insert(
-                id.clone(),
-                Node::Sink {
-                    ty: config.inner.input().data_type(),
-                },
-            );
+            graph.nodes.entry(id.clone()).or_default().push(Node::Sink {
+                ty: config.inner.input().data_type(),
+            });
         }
 
         // With all of the nodes added, go through inputs and add edges, resolving strings into
@@ -161,7 +160,11 @@ impl Graph {
             });
             Ok(())
         } else {
-            let output_type = match self.nodes.get(to) {
+            let output_type = match self.nodes.get(to).and_then(|nodes| {
+                nodes
+                    .iter()
+                    .find(|n| matches!(n, Node::Transform { .. } | Node::Sink { .. }))
+            }) {
                 Some(Node::Transform { .. }) => "transform",
                 Some(Node::Sink { .. }) => "sink",
                 _ => panic!("only transforms and sinks have inputs"),
@@ -170,6 +173,7 @@ impl Graph {
                 "Available components:\n{}",
                 self.nodes
                     .iter()
+                    .flat_map(|(key, nodes)| nodes.iter().map(move |node| (key, node)))
                     .map(|(key, node)| format!("\"{}\":\n  {}", key, node))
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -187,10 +191,13 @@ impl Graph {
     /// Will panic if the given key is not present in the graph or identifies a source, which can't
     /// have inputs.
     fn get_input_type(&self, key: &ComponentKey) -> DataType {
-        match self.nodes[key] {
-            Node::Source { .. } => panic!("no inputs on sources"),
-            Node::Transform { in_ty, .. } => in_ty,
-            Node::Sink { ty } => ty,
+        match self.nodes[key]
+            .iter()
+            .find(|n| matches!(n, Node::Transform { .. } | Node::Sink { .. }))
+        {
+            Some(Node::Transform { in_ty, .. }) => *in_ty,
+            Some(Node::Sink { ty }) => *ty,
+            _ => panic!("no inputs on sources"),
         }
     }
 
@@ -201,18 +208,21 @@ impl Graph {
     /// Will panic if the given id is not present in the graph or identifies a sink, which can't
     /// have inputs.
     fn get_output_type(&self, id: &OutputId) -> DataType {
-        match &self.nodes[&id.component] {
-            Node::Source { outputs } => outputs
+        match &self.nodes[&id.component]
+            .iter()
+            .find(|n| matches!(n, Node::Source { .. } | Node::Transform { .. }))
+        {
+            Some(Node::Source { outputs }) => outputs
                 .iter()
                 .find(|output| output.port == id.port)
                 .map(|output| output.ty)
                 .expect("output didn't exist"),
-            Node::Transform { outputs, .. } => outputs
+            Some(Node::Transform { outputs, .. }) => outputs
                 .iter()
                 .find(|output| output.port == id.port)
                 .map(|output| output.ty)
                 .expect("output didn't exist"),
-            Node::Sink { .. } => panic!("no outputs on sinks"),
+            _ => panic!("no outputs on sinks"),
         }
     }
 
@@ -243,10 +253,14 @@ impl Graph {
 
     pub fn check_for_cycles(&self) -> Result<(), String> {
         // find all sinks
-        let sinks = self.nodes.iter().filter_map(|(name, node)| match node {
-            Node::Sink { .. } => Some(name),
-            _ => None,
-        });
+        let sinks = self
+            .nodes
+            .iter()
+            .flat_map(|(name, nodes)| nodes.iter().map(move |n| (name, n)))
+            .filter_map(|(name, node)| match node {
+                Node::Sink { .. } => Some(name),
+                _ => None,
+            });
 
         // run DFS from each sink while keep tracking the current stack to detect cycles
         for s in sinks {
@@ -296,6 +310,7 @@ impl Graph {
     pub fn valid_inputs(&self) -> HashSet<OutputId> {
         self.nodes
             .iter()
+            .flat_map(|(key, node)| node.iter().map(move |n| (key, n)))
             .flat_map(|(key, node)| match node {
                 Node::Sink { .. } => vec![],
                 Node::Source { outputs } => outputs
@@ -389,7 +404,10 @@ impl Graph {
             .into_iter()
             .filter(|path| {
                 if let Some(key) = path.last() {
-                    matches!(self.nodes.get(key), Some(Node::Sink { ty: _ }))
+                    self.nodes
+                        .get(key)
+                        .map(|nodes| nodes.iter().any(|n| matches!(n, Node::Sink { .. })))
+                        .unwrap_or(false)
                 } else {
                     false
                 }
@@ -407,16 +425,13 @@ mod test {
 
     impl Graph {
         fn add_source(&mut self, id: &str, ty: DataType) {
-            self.nodes.insert(
-                id.into(),
-                Node::Source {
-                    outputs: vec![match ty {
-                        DataType::Metric => SourceOutput::new_metrics(),
-                        DataType::Trace => SourceOutput::new_traces(),
-                        _ => SourceOutput::new_maybe_logs(ty, Definition::any()),
-                    }],
-                },
-            );
+            self.nodes.entry(id.into()).or_default().push(Node::Source {
+                outputs: vec![match ty {
+                    DataType::Metric => SourceOutput::new_metrics(),
+                    DataType::Trace => SourceOutput::new_traces(),
+                    _ => SourceOutput::new_maybe_logs(ty, Definition::any()),
+                }],
+            });
         }
 
         fn add_transform(
@@ -428,16 +443,16 @@ mod test {
         ) {
             let id = ComponentKey::from(id);
             let inputs = clean_inputs(inputs);
-            self.nodes.insert(
-                id.clone(),
-                Node::Transform {
+            self.nodes
+                .entry(id.clone())
+                .or_default()
+                .push(Node::Transform {
                     in_ty,
                     outputs: vec![TransformOutput::new(
                         out_ty,
                         [("test".into(), Definition::default_legacy_namespace())].into(),
                     )],
-                },
-            );
+                });
             for from in inputs {
                 self.edges.push(Edge {
                     from,
@@ -448,7 +463,11 @@ mod test {
 
         fn add_transform_output(&mut self, id: &str, name: &str, ty: DataType) {
             let id = id.into();
-            match self.nodes.get_mut(&id) {
+            match self
+                .nodes
+                .get_mut(&id)
+                .and_then(|v| v.iter_mut().find(|p| matches!(p, Node::Transform { .. })))
+            {
                 Some(Node::Transform { outputs, .. }) => outputs.push(
                     TransformOutput::new(
                         ty,
@@ -463,7 +482,10 @@ mod test {
         fn add_sink(&mut self, id: &str, ty: DataType, inputs: Vec<&str>) {
             let id = ComponentKey::from(id);
             let inputs = clean_inputs(inputs);
-            self.nodes.insert(id.clone(), Node::Sink { ty });
+            self.nodes
+                .entry(id.clone())
+                .or_default()
+                .push(Node::Sink { ty });
             for from in inputs {
                 self.edges.push(Edge {
                     from,

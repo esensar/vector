@@ -218,7 +218,7 @@ impl Memory {
             shutdown,
             out,
             log_namespace,
-            dump_batch_size: self.config.dump_batch_size as usize,
+            dump_batch_size: self.config.dump_batch_size.map(|d| d as usize),
         }
     }
 }
@@ -370,7 +370,7 @@ pub struct MemorySource {
     shutdown: ShutdownSignal,
     out: SourceSender,
     log_namespace: LogNamespace,
-    dump_batch_size: usize,
+    dump_batch_size: Option<usize>,
 }
 
 impl MemorySource {
@@ -378,7 +378,10 @@ impl MemorySource {
         let events_received = register!(EventsReceived);
         let bytes_received = register!(BytesReceived::from(Protocol::INTERNAL));
         let mut interval = IntervalStream::new(interval(Duration::from_secs(
-            self.memory.config.dump_interval,
+            self.memory
+                .config
+                .dump_interval
+                .expect("Unexpected missing dump interval in memory table used as a source."),
         )))
         .take_until(self.shutdown);
 
@@ -398,10 +401,10 @@ impl MemorySource {
                             } else {
                                 sent
                             })
-                            .take(if self.dump_batch_size == 0 {
-                                usize::MAX
+                            .take(if let Some(batch_size) = self.dump_batch_size {
+                                batch_size
                             } else {
-                                self.dump_batch_size
+                                usize::MAX
                             })
                             .filter_map(|(k, v)| {
                                 if self.memory.config.remove_after_dump {
@@ -439,8 +442,10 @@ impl MemorySource {
                 }
 
                 sent += count;
-                if self.dump_batch_size == 0 || count < self.dump_batch_size {
-                    break;
+                match self.dump_batch_size {
+                    None => break,
+                    Some(dump_batch_size) if count < dump_batch_size => break,
+                    _ => {}
                 }
             }
         }

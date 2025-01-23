@@ -135,7 +135,7 @@ impl EnrichmentTableConfig for MemoryConfig {
     }
 
     fn source_config(&self) -> Option<Box<dyn SourceConfig>> {
-        if self.dump_interval > 0 {
+        if self.dump_interval.is_some() {
             Some(Box::new(self.clone()))
         } else {
             None

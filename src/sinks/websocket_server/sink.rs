@@ -14,6 +14,7 @@ use futures::{
 };
 use futures_util::future;
 use http::{header::AUTHORIZATION, StatusCode};
+use stream_cancel::Tripwire;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::{
     handshake::server::{ErrorResponse, Request, Response},
@@ -83,18 +84,28 @@ impl WebSocketListenerSink {
     async fn handle_connections(
         auth: HttpSourceAuth,
         peers: Arc<Mutex<HashMap<SocketAddr, UnboundedSender<Message>>>>,
+        mut tripwire: Tripwire,
         mut listener: MaybeTlsListener,
     ) {
-        while let Ok(stream) = listener.accept().await {
-            tokio::spawn(
-                Self::handle_connection(auth.clone(), Arc::clone(&peers), stream).in_current_span(),
-            );
+        loop {
+            tokio::select! {
+                Ok(stream) = listener.accept() => {
+                    tokio::spawn(
+                        Self::handle_connection(auth.clone(), Arc::clone(&peers), tripwire.clone(), stream).in_current_span(),
+                    );
+                }
+
+                _ = &mut tripwire => {
+                    return
+                }
+            }
         }
     }
 
     async fn handle_connection(
         auth: HttpSourceAuth,
         peers: Arc<Mutex<HashMap<SocketAddr, UnboundedSender<Message>>>>,
+        tripwire: Tripwire,
         stream: MaybeTlsIncomingStream<TcpStream>,
     ) -> Result<(), ()> {
         let addr = stream.peer_addr();
@@ -103,8 +114,7 @@ impl WebSocketListenerSink {
         let header_callback = |req: &Request, response: Response| match auth.is_valid(
             &req.headers()
                 .get(AUTHORIZATION)
-                .map(|h| h.to_str().ok())
-                .flatten()
+                .and_then(|h| h.to_str().ok())
                 .map(ToString::to_string),
         ) {
             Ok(_) => Ok(response),
@@ -119,6 +129,7 @@ impl WebSocketListenerSink {
 
         let ws_stream = tokio_tungstenite::accept_hdr_async(stream, header_callback)
             .await
+            .map(|s| s.take_until(tripwire))
             .map_err(|err| {
                 debug!("Error during websocket handshake: {}", err);
                 emit!(WsListenerConnectionFailedError {
@@ -172,6 +183,7 @@ impl WebSocketListenerSink {
 #[async_trait]
 impl StreamSink<Event> for WebSocketListenerSink {
     async fn run(mut self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
+        println!("Start run");
         let input = input.fuse().peekable();
         pin_mut!(input);
 
@@ -180,14 +192,23 @@ impl StreamSink<Event> for WebSocketListenerSink {
         let encode_as_binary = self.should_encode_as_binary();
 
         let listener = self.tls.bind(&self.address).await.map_err(|_| ())?;
+        println!("Prepared listener");
 
-        tokio::spawn(
-            Self::handle_connections(self.auth, Arc::clone(&self.peers), listener)
-                .in_current_span(),
+        let (trigger, tripwire) = Tripwire::new();
+        let _connection_task = tokio::spawn(
+            Self::handle_connections(
+                self.auth,
+                Arc::clone(&self.peers),
+                tripwire.clone(),
+                listener,
+            )
+            .in_current_span(),
         );
+        println!("Started connection task");
 
         while input.as_mut().peek().await.is_some() {
             let mut event = input.next().await.unwrap();
+            println!("Got an event: {:?}", event);
             let finalizers = event.take_finalizers();
 
             self.transformer.transform(&mut event);
@@ -197,6 +218,7 @@ impl StreamSink<Event> for WebSocketListenerSink {
             let mut bytes = BytesMut::new();
             match self.encoder.encode(event, &mut bytes) {
                 Ok(()) => {
+                    println!("Encoded the event: {:?}", bytes);
                     finalizers.update_status(EventStatus::Delivered);
 
                     let message = if encode_as_binary {
@@ -209,21 +231,106 @@ impl StreamSink<Event> for WebSocketListenerSink {
                     let peers = self.peers.lock().unwrap();
                     let broadcast_recipients = peers.iter().map(|(_, ws_sink)| ws_sink);
                     for recp in broadcast_recipients {
+                        println!("Sending message");
                         if let Err(error) = recp.unbounded_send(message.clone()) {
+                            println!("Send failed");
                             emit!(WsListenerSendError { error });
                         } else {
+                            println!("Send success");
                             events_sent.emit(CountByteSize(1, event_byte_size));
                             bytes_sent.emit(ByteSize(message_len));
                         }
                     }
+                    println!("Done sending, waiting for more events I guess");
                 }
                 Err(_) => {
+                    println!("Some error");
                     // Error is handled by `Encoder`.
                     finalizers.update_status(EventStatus::Errored);
                 }
             };
         }
 
+        println!("Stopping connection");
+        trigger.cancel();
+        //connection_task.await.map_err(|_| ())?;
+        println!("Sink done");
         Ok(())
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::StreamExt;
+    use futures_util::stream;
+
+    use tokio::{sync::watch, time};
+    use vector_lib::sink::VectorSink;
+
+    use super::*;
+
+    use crate::{
+        event::{Event, LogEvent},
+        test_util::components::{run_and_assert_sink_compliance, SINK_TAGS},
+    };
+
+    #[tokio::test]
+    async fn test_single_client() {
+        let event = Event::Log(LogEvent::from("foo"));
+
+        let (tx, mut rx) = watch::channel(false);
+        let sink = WebSocketListenerSink::new(WebSocketListenerSinkConfig::default()).unwrap();
+
+        let clond = event.clone();
+        let compliance_assertion = tokio::spawn(run_and_assert_sink_compliance(
+            VectorSink::from_event_streamsink(sink),
+            stream::once(async move {
+                let _ = rx.changed().await;
+                println!("Producing event");
+                clond.clone()
+            }),
+            &SINK_TAGS,
+        ));
+
+        time::sleep(time::Duration::from_millis(100)).await;
+
+        println!("Trying to connect");
+        let (ws_stream, _) = tokio_tungstenite::connect_async("ws://localhost:8080")
+            .await
+            .expect("Client failed to connect.");
+        println!("Connected");
+        let (_, rx) = ws_stream.split();
+        let cevent = event.clone();
+        let handle = tokio::spawn(async move {
+            let cloned_event = cevent.clone();
+            rx.for_each(|msg| async {
+                let msg_text = msg.unwrap().into_text().unwrap();
+                let expected = serde_json::to_string(cloned_event.as_log()).unwrap();
+                assert_eq!(expected, msg_text);
+                println!("Assertion is done!");
+            })
+            .await;
+        });
+        tx.send(true).unwrap();
+        println!("Received?");
+
+        //sender.await.expect("Wut happened");
+        handle.await.expect("DONE?");
+        compliance_assertion.await.expect("cmon");
+        //send_thing.await.expect("cmon done");
+    }
+
+    //#[tokio::test]
+    //async fn sink_spec_compliance() {
+    //    let event = Event::Log(LogEvent::from("foo"));
+    //
+    //    let sink = WebSocketListenerSink::new(WebSocketListenerSinkConfig::default()).unwrap();
+    //
+    //    run_and_assert_sink_compliance(
+    //        VectorSink::from_event_streamsink(sink),
+    //        stream::once(ready(event)),
+    //        &SINK_TAGS,
+    //    )
+    //    .await;
+    //}
 }

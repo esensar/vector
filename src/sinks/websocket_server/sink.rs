@@ -262,9 +262,8 @@ impl StreamSink<Event> for WebSocketListenerSink {
 #[cfg(test)]
 mod tests {
     use futures::StreamExt;
-    use futures_util::stream;
 
-    use tokio::{sync::watch, time};
+    use tokio::time;
     use vector_lib::sink::VectorSink;
 
     use super::*;
@@ -275,20 +274,18 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn test_single_client() {
+    async fn test_single_client_2() {
         let event = Event::Log(LogEvent::from("foo"));
 
-        let (tx, mut rx) = watch::channel(false);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let input_events = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
+
         let sink = WebSocketListenerSink::new(WebSocketListenerSinkConfig::default()).unwrap();
 
-        let clond = event.clone();
+        //let clond = event.clone();
         let compliance_assertion = tokio::spawn(run_and_assert_sink_compliance(
             VectorSink::from_event_streamsink(sink),
-            stream::once(async move {
-                let _ = rx.changed().await;
-                println!("Producing event");
-                clond.clone()
-            }),
+            input_events,
             &SINK_TAGS,
         ));
 
@@ -304,21 +301,68 @@ mod tests {
         let handle = tokio::spawn(async move {
             let cloned_event = cevent.clone();
             rx.for_each(|msg| async {
+                println!("Received a message...");
                 let msg_text = msg.unwrap().into_text().unwrap();
                 let expected = serde_json::to_string(cloned_event.as_log()).unwrap();
                 assert_eq!(expected, msg_text);
                 println!("Assertion is done!");
-            })
-            .await;
+            });
         });
-        tx.send(true).unwrap();
+        tx.send(event).expect("Failed to send.");
         println!("Received?");
 
         //sender.await.expect("Wut happened");
         handle.await.expect("DONE?");
+        drop(tx);
         compliance_assertion.await.expect("cmon");
         //send_thing.await.expect("cmon done");
     }
+
+    //#[tokio::test]
+    //async fn test_single_client() {
+    //    let event = Event::Log(LogEvent::from("foo"));
+    //
+    //    let (tx, mut rx) = watch::channel(false);
+    //    let sink = WebSocketListenerSink::new(WebSocketListenerSinkConfig::default()).unwrap();
+    //
+    //    let clond = event.clone();
+    //    let compliance_assertion = tokio::spawn(run_and_assert_sink_compliance(
+    //        VectorSink::from_event_streamsink(sink),
+    //        stream::once(async move {
+    //            let _ = rx.changed().await;
+    //            println!("Producing event");
+    //            clond.clone()
+    //        }),
+    //        &SINK_TAGS,
+    //    ));
+    //
+    //    time::sleep(time::Duration::from_millis(100)).await;
+    //
+    //    println!("Trying to connect");
+    //    let (ws_stream, _) = tokio_tungstenite::connect_async("ws://localhost:8080")
+    //        .await
+    //        .expect("Client failed to connect.");
+    //    println!("Connected");
+    //    let (_, rx) = ws_stream.split();
+    //    let cevent = event.clone();
+    //    let handle = tokio::spawn(async move {
+    //        let cloned_event = cevent.clone();
+    //        rx.for_each(|msg| async {
+    //            let msg_text = msg.unwrap().into_text().unwrap();
+    //            let expected = serde_json::to_string(cloned_event.as_log()).unwrap();
+    //            assert_eq!(expected, msg_text);
+    //            println!("Assertion is done!");
+    //        })
+    //        .await;
+    //    });
+    //    tx.send(true).unwrap();
+    //    println!("Received?");
+    //
+    //    //sender.await.expect("Wut happened");
+    //    handle.await.expect("DONE?");
+    //    compliance_assertion.await.expect("cmon");
+    //    //send_thing.await.expect("cmon done");
+    //}
 
     //#[tokio::test]
     //async fn sink_spec_compliance() {

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
@@ -40,7 +40,7 @@ use crate::{
     sources::util::http::HttpSourceAuth,
 };
 
-use super::WebSocketListenerSinkConfig;
+use super::{config::MessageBuffering, WebSocketListenerSinkConfig};
 
 pub struct WebSocketListenerSink {
     peers: Arc<Mutex<HashMap<SocketAddr, UnboundedSender<Message>>>>,
@@ -49,6 +49,7 @@ pub struct WebSocketListenerSink {
     encoder: Encoder<()>,
     address: SocketAddr,
     auth: HttpSourceAuth,
+    message_buffering: Option<MessageBuffering>,
 }
 
 impl WebSocketListenerSink {
@@ -65,6 +66,7 @@ impl WebSocketListenerSink {
             transformer,
             encoder,
             auth,
+            message_buffering: config.message_buffering,
         })
     }
 
@@ -82,6 +84,7 @@ impl WebSocketListenerSink {
     async fn handle_connections(
         auth: HttpSourceAuth,
         peers: Arc<Mutex<HashMap<SocketAddr, UnboundedSender<Message>>>>,
+        buffer: Arc<Mutex<VecDeque<Message>>>,
         mut listener: MaybeTlsListener,
     ) {
         let open_gauge = OpenGauge::new();
@@ -91,6 +94,7 @@ impl WebSocketListenerSink {
                 Self::handle_connection(
                     auth.clone(),
                     Arc::clone(&peers),
+                    Arc::clone(&buffer),
                     stream,
                     open_gauge.clone(),
                 )
@@ -102,25 +106,32 @@ impl WebSocketListenerSink {
     async fn handle_connection(
         auth: HttpSourceAuth,
         peers: Arc<Mutex<HashMap<SocketAddr, UnboundedSender<Message>>>>,
+        buffer: Arc<Mutex<VecDeque<Message>>>,
         stream: MaybeTlsIncomingStream<TcpStream>,
         open_gauge: OpenGauge,
     ) -> Result<(), ()> {
         let addr = stream.peer_addr();
         debug!("Incoming TCP connection from: {}", addr);
 
-        let header_callback = |req: &Request, response: Response| match auth.is_valid(
-            &req.headers()
-                .get(AUTHORIZATION)
-                .and_then(|h| h.to_str().ok())
-                .map(ToString::to_string),
-        ) {
-            Ok(_) => Ok(response),
-            Err(message) => {
-                let mut response = ErrorResponse::default();
-                *response.status_mut() = StatusCode::UNAUTHORIZED;
-                *response.body_mut() = Some(message.message().to_string());
-                debug!("Websocket handshake auth validation failed: {}", message);
-                Err(response)
+        let mut should_send_buffered_messages = false;
+        let header_callback = |req: &Request, response: Response| {
+            if req.uri().query().unwrap_or("").contains("last_received") {
+                should_send_buffered_messages = true;
+            }
+            match auth.is_valid(
+                &req.headers()
+                    .get(AUTHORIZATION)
+                    .and_then(|h| h.to_str().ok())
+                    .map(ToString::to_string),
+            ) {
+                Ok(_) => Ok(response),
+                Err(message) => {
+                    let mut response = ErrorResponse::default();
+                    *response.status_mut() = StatusCode::UNAUTHORIZED;
+                    *response.body_mut() = Some(message.message().to_string());
+                    debug!("Websocket handshake auth validation failed: {}", message);
+                    Err(response)
+                }
             }
         };
 
@@ -140,6 +151,16 @@ impl WebSocketListenerSink {
 
         {
             let mut peers = peers.lock().unwrap();
+            if should_send_buffered_messages {
+                let buffered_messages = buffer.lock().unwrap();
+
+                for message in buffered_messages.iter() {
+                    if let Err(error) = tx.unbounded_send(message.clone()) {
+                        emit!(WsListenerSendError { error });
+                    }
+                }
+            }
+
             debug!("WebSocket connection established: {}", addr);
 
             peers.insert(addr, tx);
@@ -180,9 +201,22 @@ impl StreamSink<Event> for WebSocketListenerSink {
 
         let listener = self.tls.bind(&self.address).await.map_err(|_| ())?;
 
+        let message_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(
+            if let Some(MessageBuffering { ref max_events, .. }) = self.message_buffering {
+                max_events.get()
+            } else {
+                0
+            },
+        )));
+
         tokio::spawn(
-            Self::handle_connections(self.auth, Arc::clone(&self.peers), listener)
-                .in_current_span(),
+            Self::handle_connections(
+                self.auth,
+                Arc::clone(&self.peers),
+                Arc::clone(&message_buffer),
+                listener,
+            )
+            .in_current_span(),
         );
 
         while input.as_mut().peek().await.is_some() {
@@ -204,6 +238,14 @@ impl StreamSink<Event> for WebSocketListenerSink {
                         Message::text(String::from_utf8_lossy(&bytes))
                     };
                     let message_len = message.len();
+
+                    if let Some(ref buffering_config) = self.message_buffering {
+                        let mut buffer = message_buffer.lock().unwrap();
+                        if buffer.len() + 1 >= buffering_config.max_events.get() {
+                            buffer.pop_front();
+                        }
+                        buffer.push_back(message.clone());
+                    }
 
                     let peers = self.peers.lock().unwrap();
                     let broadcast_recipients = peers.iter().map(|(_, ws_sink)| ws_sink);
@@ -231,7 +273,7 @@ impl StreamSink<Event> for WebSocketListenerSink {
 mod tests {
     use futures::{channel::mpsc::UnboundedReceiver, SinkExt, Stream, StreamExt};
     use futures_util::stream;
-    use std::future::ready;
+    use std::{future::ready, num::NonZeroUsize};
 
     use tokio::{task::JoinHandle, time};
     use vector_lib::sink::VectorSink;
@@ -240,6 +282,7 @@ mod tests {
 
     use crate::{
         event::{Event, LogEvent},
+        sinks::websocket_server::config::MessageBuffering,
         test_util::{
             components::{run_and_assert_sink_compliance, SINK_TAGS},
             next_addr,
@@ -348,6 +391,85 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn test_client_late_connect_with_buffering() {
+        let event1 = Event::Log(LogEvent::from("foo1"));
+        let event2 = Event::Log(LogEvent::from("foo2"));
+
+        let (mut sender, input_events) = build_test_event_channel();
+        let address = next_addr();
+        let port = address.port();
+
+        let websocket_sink = start_websocket_server_sink(
+            WebSocketListenerSinkConfig {
+                address,
+                message_buffering: Some(MessageBuffering {
+                    max_events: NonZeroUsize::new(1).unwrap(),
+                }),
+                ..Default::default()
+            },
+            input_events,
+        )
+        .await;
+
+        // Sending event 1 before client joined, the client without buffering should not receive it
+        sender.send(event1.clone()).await.expect("Failed to send.");
+
+        // Now connect the clients
+        let client_handle = attach_websocket_client(port, vec![event2.clone()]).await;
+        let client_with_buffer_handle = attach_websocket_client_with_query(
+            port,
+            "last_received=0",
+            vec![event1.clone(), event2.clone()],
+        )
+        .await;
+
+        // Sending event 2, this one should be received by both clients
+        sender.send(event2).await.expect("Failed to send.");
+
+        client_handle.await.unwrap();
+        client_with_buffer_handle.await.unwrap();
+        drop(sender);
+        websocket_sink.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_client_late_connect_with_buffering_over_max_events_limit() {
+        let event1 = Event::Log(LogEvent::from("foo1"));
+        let event2 = Event::Log(LogEvent::from("foo2"));
+
+        let (mut sender, input_events) = build_test_event_channel();
+        let address = next_addr();
+        let port = address.port();
+
+        let websocket_sink = start_websocket_server_sink(
+            WebSocketListenerSinkConfig {
+                address,
+                message_buffering: Some(MessageBuffering {
+                    max_events: NonZeroUsize::new(1).unwrap(),
+                }),
+                ..Default::default()
+            },
+            input_events,
+        )
+        .await;
+
+        let client_handle =
+            attach_websocket_client(port, vec![event1.clone(), event2.clone()]).await;
+
+        // Sending 2 events before client joined, the client without buffering should receive just one
+        sender.send(event1.clone()).await.expect("Failed to send.");
+        sender.send(event2.clone()).await.expect("Failed to send.");
+
+        let client_with_buffer_handle =
+            attach_websocket_client_with_query(port, "last_received=0", vec![event2.clone()]).await;
+
+        client_handle.await.unwrap();
+        client_with_buffer_handle.await.unwrap();
+        drop(sender);
+        websocket_sink.await.unwrap();
+    }
+
     async fn start_websocket_server_sink<S>(
         config: WebSocketListenerSinkConfig,
         events: S,
@@ -368,8 +490,24 @@ mod tests {
         compliance_assertion
     }
 
+    async fn attach_websocket_client_with_query(
+        port: u16,
+        query: &str,
+        expected_events: Vec<Event>,
+    ) -> JoinHandle<()> {
+        attach_websocket_client_url(format!("ws://localhost:{port}/?{query}"), expected_events)
+            .await
+    }
+
     async fn attach_websocket_client(port: u16, expected_events: Vec<Event>) -> JoinHandle<()> {
-        let (ws_stream, _) = tokio_tungstenite::connect_async(format!("ws://localhost:{port}"))
+        attach_websocket_client_url(format!("ws://localhost:{port}"), expected_events).await
+    }
+
+    async fn attach_websocket_client_url(
+        url: String,
+        expected_events: Vec<Event>,
+    ) -> JoinHandle<()> {
+        let (ws_stream, _) = tokio_tungstenite::connect_async(url)
             .await
             .expect("Client failed to connect.");
         let (_, rx) = ws_stream.split();

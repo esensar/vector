@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, num::NonZeroUsize};
 
-use vector_lib::codecs::JsonSerializerConfig;
 use vector_lib::configurable::configurable_component;
+use vector_lib::{codecs::JsonSerializerConfig, lookup::lookup_v2::ConfigValuePath};
 
 use crate::{
     codecs::EncodingConfig,
@@ -68,6 +68,10 @@ pub struct MessageBuffering {
     /// Max events
     #[serde(default = "default_max_events")]
     pub max_events: NonZeroUsize,
+
+    /// Message id path
+    #[serde(default, skip_serializing_if = "crate::serde::is_default")]
+    pub message_id_path: Option<ConfigValuePath>,
 }
 
 const fn default_max_events() -> NonZeroUsize {

@@ -5,7 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures::{
     channel::mpsc::{unbounded, UnboundedSender},
     pin_mut,
@@ -20,8 +20,9 @@ use tokio_tungstenite::tungstenite::{
 };
 use tokio_util::codec::Encoder as _;
 use tracing::Instrument;
+use uuid::Uuid;
 use vector_lib::{
-    event::{Event, EventStatus},
+    event::{Event, EventStatus, MaybeAsLogMut},
     finalization::Finalizable,
     internal_event::{
         ByteSize, BytesSent, CountByteSize, EventsSent, InternalEventHandle, Output, Protocol,
@@ -84,7 +85,7 @@ impl WebSocketListenerSink {
     async fn handle_connections(
         auth: HttpSourceAuth,
         peers: Arc<Mutex<HashMap<SocketAddr, UnboundedSender<Message>>>>,
-        buffer: Arc<Mutex<VecDeque<Message>>>,
+        buffer: Arc<Mutex<VecDeque<(Uuid, Message)>>>,
         mut listener: MaybeTlsListener,
     ) {
         let open_gauge = OpenGauge::new();
@@ -106,17 +107,30 @@ impl WebSocketListenerSink {
     async fn handle_connection(
         auth: HttpSourceAuth,
         peers: Arc<Mutex<HashMap<SocketAddr, UnboundedSender<Message>>>>,
-        buffer: Arc<Mutex<VecDeque<Message>>>,
+        buffer: Arc<Mutex<VecDeque<(Uuid, Message)>>>,
         stream: MaybeTlsIncomingStream<TcpStream>,
         open_gauge: OpenGauge,
     ) -> Result<(), ()> {
         let addr = stream.peer_addr();
         debug!("Incoming TCP connection from: {}", addr);
 
-        let mut should_send_buffered_messages = false;
+        let mut last_received = None;
+        let mut should_replay = false;
         let header_callback = |req: &Request, response: Response| {
-            if req.uri().query().unwrap_or("").contains("last_received") {
-                should_send_buffered_messages = true;
+            let query_params = req.uri().query().unwrap_or("");
+            if query_params.contains("last_received") {
+                should_replay = true;
+                if let Ok(url) =
+                    url::Url::parse(format!("http://ignored.com/?{}", query_params).as_str())
+                {
+                    if let Some((_, last_received_param_value)) =
+                        url.query_pairs().find(|(k, _)| k == "last_received")
+                    {
+                        if let Ok(last_received_val) = Uuid::parse_str(&last_received_param_value) {
+                            last_received = Some(last_received_val);
+                        }
+                    }
+                }
             }
             match auth.is_valid(
                 &req.headers()
@@ -151,10 +165,13 @@ impl WebSocketListenerSink {
 
         {
             let mut peers = peers.lock().unwrap();
-            if should_send_buffered_messages {
+            if should_replay {
                 let buffered_messages = buffer.lock().unwrap();
 
-                for message in buffered_messages.iter() {
+                for (_, message) in buffered_messages
+                    .iter()
+                    .filter(|(id, _)| Some(*id) > last_received)
+                {
                     if let Err(error) = tx.unbounded_send(message.clone()) {
                         emit!(WsListenerSendError { error });
                     }
@@ -221,9 +238,23 @@ impl StreamSink<Event> for WebSocketListenerSink {
 
         while input.as_mut().peek().await.is_some() {
             let mut event = input.next().await.unwrap();
+            let message_id = Uuid::now_v7();
             let finalizers = event.take_finalizers();
 
             self.transformer.transform(&mut event);
+
+            if let Some(MessageBuffering {
+                message_id_path: Some(ref message_id_path),
+                ..
+            }) = self.message_buffering
+            {
+                if let Some(log) = event.maybe_as_log_mut() {
+                    let mut buffer = [0; 36];
+                    let uuid = message_id.hyphenated().encode_lower(&mut buffer);
+                    log.value_mut()
+                        .insert(message_id_path, Bytes::copy_from_slice(uuid.as_bytes()));
+                }
+            }
 
             let event_byte_size = event.estimated_json_encoded_size_of();
 
@@ -244,7 +275,7 @@ impl StreamSink<Event> for WebSocketListenerSink {
                         if buffer.len() + 1 >= buffering_config.max_events.get() {
                             buffer.pop_front();
                         }
-                        buffer.push_back(message.clone());
+                        buffer.push_back((message_id, message.clone()));
                     }
 
                     let peers = self.peers.lock().unwrap();
@@ -405,6 +436,7 @@ mod tests {
                 address,
                 message_buffering: Some(MessageBuffering {
                     max_events: NonZeroUsize::new(1).unwrap(),
+                    message_id_path: None,
                 }),
                 ..Default::default()
             },
@@ -447,6 +479,7 @@ mod tests {
                 address,
                 message_buffering: Some(MessageBuffering {
                     max_events: NonZeroUsize::new(1).unwrap(),
+                    message_id_path: None,
                 }),
                 ..Default::default()
             },

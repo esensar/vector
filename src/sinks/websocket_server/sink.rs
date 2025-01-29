@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
 };
 
@@ -8,9 +8,9 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::{
     channel::mpsc::{unbounded, UnboundedSender},
-    pin_mut,
+    future, pin_mut,
     stream::BoxStream,
-    StreamExt,
+    StreamExt, TryStreamExt,
 };
 use http::{header::AUTHORIZATION, StatusCode};
 use tokio::net::TcpStream;
@@ -44,7 +44,6 @@ use crate::{
 use super::{config::MessageBuffering, WebSocketListenerSinkConfig};
 
 pub struct WebSocketListenerSink {
-    peers: Arc<Mutex<HashMap<SocketAddr, UnboundedSender<Message>>>>,
     tls: MaybeTlsSettings,
     transformer: Transformer,
     encoder: Encoder<()>,
@@ -61,7 +60,6 @@ impl WebSocketListenerSink {
         let encoder = Encoder::<()>::new(serializer);
         let auth = HttpSourceAuth::try_from(config.auth.as_ref())?;
         Ok(Self {
-            peers: Arc::new(Mutex::new(HashMap::new())),
             tls,
             address: config.address,
             transformer,
@@ -85,8 +83,10 @@ impl WebSocketListenerSink {
     async fn handle_connections(
         auth: HttpSourceAuth,
         peers: Arc<Mutex<HashMap<SocketAddr, UnboundedSender<Message>>>>,
+        client_checkpoints: Arc<Mutex<HashMap<IpAddr, Uuid>>>,
         buffer: Arc<Mutex<VecDeque<(Uuid, Message)>>>,
         mut listener: MaybeTlsListener,
+        handle_incoming_data: bool,
     ) {
         let open_gauge = OpenGauge::new();
 
@@ -95,9 +95,11 @@ impl WebSocketListenerSink {
                 Self::handle_connection(
                     auth.clone(),
                     Arc::clone(&peers),
+                    Arc::clone(&client_checkpoints),
                     Arc::clone(&buffer),
                     stream,
                     open_gauge.clone(),
+                    handle_incoming_data,
                 )
                 .in_current_span(),
             );
@@ -107,15 +109,22 @@ impl WebSocketListenerSink {
     async fn handle_connection(
         auth: HttpSourceAuth,
         peers: Arc<Mutex<HashMap<SocketAddr, UnboundedSender<Message>>>>,
+        client_checkpoints: Arc<Mutex<HashMap<IpAddr, Uuid>>>,
         buffer: Arc<Mutex<VecDeque<(Uuid, Message)>>>,
         stream: MaybeTlsIncomingStream<TcpStream>,
         open_gauge: OpenGauge,
+        handle_incoming_data: bool,
     ) -> Result<(), ()> {
         let addr = stream.peer_addr();
         debug!("Incoming TCP connection from: {}", addr);
 
         let mut last_received = None;
         let mut should_replay = false;
+
+        if let Some(checkpoint) = client_checkpoints.lock().unwrap().get(&addr.ip()) {
+            last_received = Some(*checkpoint);
+            should_replay = true;
+        }
         let header_callback = |req: &Request, response: Response| {
             let query_params = req.uri().query().unwrap_or("");
             if query_params.contains("last_received") {
@@ -186,12 +195,29 @@ impl WebSocketListenerSink {
             });
         }
 
-        let (outgoing, _incoming) = ws_stream.split();
+        let (outgoing, incoming) = ws_stream.split();
 
+        let incoming_data_handler = incoming.try_for_each(|msg| {
+            if handle_incoming_data {
+                let ip = addr.ip();
+                debug!("Received a message from {}: {}", ip, msg.to_text().unwrap());
+
+                if let Ok(checkpoint) = msg
+                    .to_text()
+                    .map_err(|_| ())
+                    .and_then(|msg| Uuid::parse_str(msg.trim()).map_err(|_| ()))
+                {
+                    debug!("Inserting checkpoint for {}: {}", ip, checkpoint);
+                    client_checkpoints.lock().unwrap().insert(ip, checkpoint);
+                }
+            }
+
+            future::ok(())
+        });
         let forward_data_to_client = rx.map(Ok).forward(outgoing);
 
-        pin_mut!(forward_data_to_client);
-        let _ = forward_data_to_client.await;
+        pin_mut!(forward_data_to_client, incoming_data_handler);
+        future::select(forward_data_to_client, incoming_data_handler).await;
 
         {
             let mut peers = peers.lock().unwrap();
@@ -218,6 +244,7 @@ impl StreamSink<Event> for WebSocketListenerSink {
 
         let listener = self.tls.bind(&self.address).await.map_err(|_| ())?;
 
+        let peers = Arc::new(Mutex::new(HashMap::default()));
         let message_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(
             if let Some(MessageBuffering { ref max_events, .. }) = self.message_buffering {
                 max_events.get()
@@ -225,13 +252,21 @@ impl StreamSink<Event> for WebSocketListenerSink {
                 0
             },
         )));
+        let client_checkpoints = Arc::new(Mutex::new(HashMap::default()));
 
+        let handle_incoming_data = self
+            .message_buffering
+            .as_ref()
+            .map(|b| b.track_client_acks)
+            .unwrap_or(false);
         tokio::spawn(
             Self::handle_connections(
                 self.auth,
-                Arc::clone(&self.peers),
+                Arc::clone(&peers),
+                Arc::clone(&client_checkpoints),
                 Arc::clone(&message_buffer),
                 listener,
+                handle_incoming_data,
             )
             .in_current_span(),
         );
@@ -278,7 +313,7 @@ impl StreamSink<Event> for WebSocketListenerSink {
                         buffer.push_back((message_id, message.clone()));
                     }
 
-                    let peers = self.peers.lock().unwrap();
+                    let peers = peers.lock().unwrap();
                     let broadcast_recipients = peers.iter().map(|(_, ws_sink)| ws_sink);
                     for recp in broadcast_recipients {
                         if let Err(error) = recp.unbounded_send(message.clone()) {
@@ -437,6 +472,7 @@ mod tests {
                 message_buffering: Some(MessageBuffering {
                     max_events: NonZeroUsize::new(1).unwrap(),
                     message_id_path: None,
+                    track_client_acks: false,
                 }),
                 ..Default::default()
             },
@@ -480,6 +516,7 @@ mod tests {
                 message_buffering: Some(MessageBuffering {
                     max_events: NonZeroUsize::new(1).unwrap(),
                     message_id_path: None,
+                    track_client_acks: false,
                 }),
                 ..Default::default()
             },

@@ -72,6 +72,10 @@ pub struct MessageBuffering {
     /// Message id path
     #[serde(default, skip_serializing_if = "crate::serde::is_default")]
     pub message_id_path: Option<ConfigValuePath>,
+
+    /// Track clients
+    #[serde(default = "crate::serde::default_false")]
+    pub track_client_acks: bool,
 }
 
 const fn default_max_events() -> NonZeroUsize {

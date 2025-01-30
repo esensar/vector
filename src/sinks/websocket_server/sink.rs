@@ -20,6 +20,7 @@ use tokio_tungstenite::tungstenite::{
 };
 use tokio_util::codec::Encoder as _;
 use tracing::Instrument;
+use url::Url;
 use vector_lib::{
     event::{Event, EventStatus},
     finalization::Finalizable,
@@ -35,12 +36,13 @@ use crate::{
     codecs::{Encoder, Transformer},
     internal_events::{
         ConnectionOpen, OpenGauge, WsListenerConnectionEstablished,
-        WsListenerConnectionFailedError, WsListenerConnectionShutdown, WsListenerSendError,
+        WsListenerConnectionFailedError, WsListenerConnectionShutdown, WsListenerMessageSent,
+        WsListenerSendError,
     },
     sources::util::http::HttpSourceAuth,
 };
 
-use super::WebSocketListenerSinkConfig;
+use super::{config::ExtraMetricTagsConfig, WebSocketListenerSinkConfig};
 
 pub struct WebSocketListenerSink {
     peers: Arc<Mutex<HashMap<SocketAddr, UnboundedSender<Message>>>>,
@@ -49,6 +51,7 @@ pub struct WebSocketListenerSink {
     encoder: Encoder<()>,
     address: SocketAddr,
     auth: HttpSourceAuth,
+    extra_tags_config: HashMap<String, ExtraMetricTagsConfig>,
 }
 
 impl WebSocketListenerSink {
@@ -65,6 +68,7 @@ impl WebSocketListenerSink {
             transformer,
             encoder,
             auth,
+            extra_tags_config: config.internal_metrics.extra_tags,
         })
     }
 
@@ -79,9 +83,19 @@ impl WebSocketListenerSink {
         }
     }
 
+    //// Used to reduce duplication as we are entering this span multiple times
+    //// To avoid adding extra tags to standard Vector metrics (open connections and common sink
+    //// metrics)
+    //fn extra_tags_span(extra_tags: &HashMap<String, String>) -> Span {
+    //    let labels: Vec<_> = extra_tags.iter().collect();
+    //    let span = error_span!("sink", &labels);
+    //    span
+    //}
+
     async fn handle_connections(
         auth: HttpSourceAuth,
         peers: Arc<Mutex<HashMap<SocketAddr, UnboundedSender<Message>>>>,
+        extra_tags_config: HashMap<String, ExtraMetricTagsConfig>,
         mut listener: MaybeTlsListener,
     ) {
         let open_gauge = OpenGauge::new();
@@ -92,6 +106,7 @@ impl WebSocketListenerSink {
                     auth.clone(),
                     Arc::clone(&peers),
                     stream,
+                    extra_tags_config.clone(),
                     open_gauge.clone(),
                 )
                 .in_current_span(),
@@ -103,10 +118,26 @@ impl WebSocketListenerSink {
         auth: HttpSourceAuth,
         peers: Arc<Mutex<HashMap<SocketAddr, UnboundedSender<Message>>>>,
         stream: MaybeTlsIncomingStream<TcpStream>,
+        extra_tags_config: HashMap<String, ExtraMetricTagsConfig>,
         open_gauge: OpenGauge,
     ) -> Result<(), ()> {
         let addr = stream.peer_addr();
         debug!("Incoming TCP connection from: {}", addr);
+
+        let mut extra_tags: Vec<(String, String)> = extra_tags_config
+            .iter()
+            .filter_map(|(key, value)| match value {
+                ExtraMetricTagsConfig::Fixed { value } => Some((key.clone(), value.clone())),
+                ExtraMetricTagsConfig::IpAddress { with_port } => {
+                    if *with_port {
+                        Some((key.clone(), addr.to_string()))
+                    } else {
+                        Some((key.clone(), addr.ip().to_string()))
+                    }
+                }
+                _ => None,
+            })
+            .collect();
 
         let header_callback = |req: &Request, response: Response| match auth.is_valid(
             &req.headers()
@@ -114,7 +145,32 @@ impl WebSocketListenerSink {
                 .and_then(|h| h.to_str().ok())
                 .map(ToString::to_string),
         ) {
-            Ok(_) => Ok(response),
+            Ok(_) => {
+                extra_tags_config
+                    .iter()
+                    .filter_map(|(key, value)| match value {
+                        ExtraMetricTagsConfig::Header { name } => req
+                            .headers()
+                            .get(name)
+                            .and_then(|h| h.to_str().ok())
+                            .map(ToString::to_string)
+                            .map(|header| (key.clone(), header)),
+                        ExtraMetricTagsConfig::Url => Some((key.clone(), req.uri().to_string())),
+                        ExtraMetricTagsConfig::Query { name } => Url::parse(&req.uri().to_string())
+                            .ok()
+                            .and_then(|url| {
+                                url.query_pairs()
+                                    .find(|(k, _)| k == name)
+                                    .map(|(_, value)| value.to_string())
+                            })
+                            .map(|value| (key.clone(), value)),
+                        _ => None,
+                    })
+                    .for_each(|(key, value)| {
+                        extra_tags.push((key, value));
+                    });
+                Ok(response)
+            }
             Err(message) => {
                 let mut response = ErrorResponse::default();
                 *response.status_mut() = StatusCode::UNAUTHORIZED;
@@ -129,7 +185,8 @@ impl WebSocketListenerSink {
             .map_err(|err| {
                 debug!("Error during websocket handshake: {}", err);
                 emit!(WsListenerConnectionFailedError {
-                    error: Box::new(err)
+                    error: Box::new(err),
+                    extra_tags: extra_tags.clone()
                 })
             })?;
 
@@ -144,13 +201,22 @@ impl WebSocketListenerSink {
 
             peers.insert(addr, tx);
             emit!(WsListenerConnectionEstablished {
-                client_count: peers.len()
+                client_count: peers.len(),
+                extra_tags: extra_tags.clone()
             });
         }
 
         let (outgoing, _incoming) = ws_stream.split();
 
-        let forward_data_to_client = rx.map(Ok).forward(outgoing);
+        let forward_data_to_client = rx
+            .map(|message| {
+                emit!(WsListenerMessageSent {
+                    message_size: message.len(),
+                    extra_tags: extra_tags.clone()
+                });
+                Ok(message)
+            })
+            .forward(outgoing);
 
         pin_mut!(forward_data_to_client);
         let _ = forward_data_to_client.await;
@@ -160,7 +226,8 @@ impl WebSocketListenerSink {
             debug!("{} disconnected", &addr);
             peers.remove(&addr);
             emit!(WsListenerConnectionShutdown {
-                client_count: peers.len()
+                client_count: peers.len(),
+                extra_tags: extra_tags.clone()
             });
         }
 
@@ -181,8 +248,13 @@ impl StreamSink<Event> for WebSocketListenerSink {
         let listener = self.tls.bind(&self.address).await.map_err(|_| ())?;
 
         tokio::spawn(
-            Self::handle_connections(self.auth, Arc::clone(&self.peers), listener)
-                .in_current_span(),
+            Self::handle_connections(
+                self.auth,
+                Arc::clone(&self.peers),
+                self.extra_tags_config,
+                listener,
+            )
+            .in_current_span(),
         );
 
         while input.as_mut().peek().await.is_some() {

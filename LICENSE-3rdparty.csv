@@ -55,6 +55,7 @@ aws-sdk-cloudwatch,https://github.com/awslabs/aws-sdk-rust,Apache-2.0,"AWS Rust 
 aws-sdk-cloudwatchlogs,https://github.com/awslabs/aws-sdk-rust,Apache-2.0,"AWS Rust SDK Team <aws-sdk-rust@amazon.com>, Russell Cohen <rcoh@amazon.com>"
 aws-sdk-firehose,https://github.com/awslabs/aws-sdk-rust,Apache-2.0,"AWS Rust SDK Team <aws-sdk-rust@amazon.com>, Russell Cohen <rcoh@amazon.com>"
 aws-sdk-kinesis,https://github.com/awslabs/aws-sdk-rust,Apache-2.0,"AWS Rust SDK Team <aws-sdk-rust@amazon.com>, Russell Cohen <rcoh@amazon.com>"
+aws-sdk-kms,https://github.com/awslabs/aws-sdk-rust,Apache-2.0,"AWS Rust SDK Team <aws-sdk-rust@amazon.com>, Russell Cohen <rcoh@amazon.com>"
 aws-sdk-s3,https://github.com/awslabs/aws-sdk-rust,Apache-2.0,"AWS Rust SDK Team <aws-sdk-rust@amazon.com>, Russell Cohen <rcoh@amazon.com>"
 aws-sdk-secretsmanager,https://github.com/awslabs/aws-sdk-rust,Apache-2.0,"AWS Rust SDK Team <aws-sdk-rust@amazon.com>, Russell Cohen <rcoh@amazon.com>"
 aws-sdk-sns,https://github.com/awslabs/aws-sdk-rust,Apache-2.0,"AWS Rust SDK Team <aws-sdk-rust@amazon.com>, Russell Cohen <rcoh@amazon.com>"
@@ -85,7 +86,7 @@ backon,https://github.com/Xuanwo/backon,Apache-2.0,Xuanwo <github@xuanwo.io>
 backtrace,https://github.com/rust-lang/backtrace-rs,MIT OR Apache-2.0,The Rust Project Developers
 base16,https://github.com/thomcc/rust-base16,CC0-1.0,Thom Chiovoloni <tchiovoloni@mozilla.com>
 base16ct,https://github.com/RustCrypto/formats/tree/master/base16ct,Apache-2.0 OR MIT,RustCrypto Developers
-base62,https://github.com/fbernier/base62,MIT,"François Bernier <frankbernier@gmail.com>, Chai T. Rex <ChaiTRex@users.noreply.github.com>, Kevin Darlington <kevin@outroot.com>, Christopher Tarquini <code@tarq.io>"
+base62,https://github.com/fbernier/base62,MIT,"François Bernier <frankbernier@gmail.com>, Chai T. Rex <ChaiTRex@users.noreply.github.com>"
 base64,https://github.com/marshallpierce/rust-base64,MIT OR Apache-2.0,"Alice Maz <alice@alicemaz.com>, Marshall Pierce <marshall@mpierce.org>"
 base64,https://github.com/marshallpierce/rust-base64,MIT OR Apache-2.0,Marshall Pierce <marshall@mpierce.org>
 base64-simd,https://github.com/Nugine/simd,MIT,The base64-simd Authors
@@ -146,7 +147,6 @@ concurrent-queue,https://github.com/smol-rs/concurrent-queue,Apache-2.0 OR MIT,"
 const-oid,https://github.com/RustCrypto/formats/tree/master/const-oid,Apache-2.0 OR MIT,RustCrypto Developers
 const_fn,https://github.com/taiki-e/const_fn,Apache-2.0 OR MIT,The const_fn Authors
 convert_case,https://github.com/rutrum/convert-case,MIT,David Purdum <purdum41@gmail.com>
-convert_case,https://github.com/rutrum/convert-case,MIT,Rutrum <dave@rutrum.net>
 convert_case,https://github.com/rutrum/convert-case,MIT,rutrum <dave@rutrum.net>
 cookie-factory,https://github.com/rust-bakery/cookie-factory,MIT,"Geoffroy Couprie <geo.couprie@gmail.com>, Pierre Chifflier <chifflier@wzdftpd.net>"
 core-foundation,https://github.com/servo/core-foundation-rs,MIT  OR  Apache-2.0,The Servo Project Developers
@@ -287,7 +287,6 @@ http-serde,https://gitlab.com/kornelski/http-serde,Apache-2.0 OR MIT,Kornel <kor
 http-types,https://github.com/http-rs/http-types,MIT OR Apache-2.0,Yoshua Wuyts <yoshuawuyts@gmail.com>
 httparse,https://github.com/seanmonstar/httparse,MIT OR Apache-2.0,Sean McArthur <sean@seanmonstar.com>
 httpdate,https://github.com/pyfisch/httpdate,MIT OR Apache-2.0,Pyfisch <pyfisch@posteo.org>
-humantime,https://github.com/tailhook/humantime,MIT OR Apache-2.0,Paul Colomiets <paul@colomiets.name>
 hyper,https://github.com/hyperium/hyper,MIT,Sean McArthur <sean@seanmonstar.com>
 hyper-named-pipe,https://github.com/fussybeaver/hyper-named-pipe,Apache-2.0,The hyper-named-pipe Authors
 hyper-openssl,https://github.com/sfackler/hyper-openssl,MIT OR Apache-2.0,Steven Fackler <sfackler@gmail.com>
@@ -639,7 +638,6 @@ tokio-postgres,https://github.com/sfackler/rust-postgres,MIT OR Apache-2.0,Steve
 tokio-retry,https://github.com/srijs/rust-tokio-retry,MIT,Sam Rijs <srijs@airpost.net>
 tokio-rustls,https://github.com/rustls/tokio-rustls,MIT OR Apache-2.0,The tokio-rustls Authors
 tokio-tungstenite,https://github.com/snapview/tokio-tungstenite,MIT,"Daniel Abramov <dabramov@snapview.de>, Alexey Galakhov <agalakhov@snapview.de>"
-tokio-websockets,https://github.com/Gelbpunkt/tokio-websockets,MIT,The tokio-websockets Authors
 toml,https://github.com/toml-rs/toml,MIT OR Apache-2.0,Alex Crichton <alex@alexcrichton.com>
 toml_edit,https://github.com/toml-rs/toml,MIT OR Apache-2.0,"Andronik Ordian <write@reusable.software>, Ed Page <eopage@gmail.com>"
 tonic,https://github.com/hyperium/tonic,MIT,Lucio Franco <luciofranco14@gmail.com>
@@ -656,7 +654,6 @@ triomphe,https://github.com/Manishearth/triomphe,MIT OR Apache-2.0,"Manish Goreg
 trust-dns-proto,https://github.com/bluejekyll/trust-dns,MIT OR Apache-2.0,Benjamin Fry <benjaminfry@me.com>
 trust-dns-resolver,https://github.com/bluejekyll/trust-dns,MIT OR Apache-2.0,Benjamin Fry <benjaminfry@me.com>
 try-lock,https://github.com/seanmonstar/try-lock,MIT,Sean McArthur <sean@seanmonstar.com>
-tryhard,https://github.com/EmbarkStudios/tryhard,MIT OR Apache-2.0,Embark <opensource@embark-studios.com>
 tungstenite,https://github.com/snapview/tungstenite-rs,MIT OR Apache-2.0,"Alexey Galakhov, Daniel Abramov"
 twox-hash,https://github.com/shepmaster/twox-hash,MIT,Jake Goulding <jake.goulding@gmail.com>
 typed-builder,https://github.com/idanarye/rust-typed-builder,MIT OR Apache-2.0,"IdanArye <idanarye@gmail.com>, Chris Morgan <me@chrismorgan.info>"
@@ -696,6 +693,7 @@ walkdir,https://github.com/BurntSushi/walkdir,Unlicense OR MIT,Andrew Gallant <j
 want,https://github.com/seanmonstar/want,MIT,Sean McArthur <sean@seanmonstar.com>
 warp,https://github.com/seanmonstar/warp,MIT,Sean McArthur <sean@seanmonstar.com>
 wasi,https://github.com/bytecodealliance/wasi,Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT,The Cranelift Project Developers
+wasi,https://github.com/bytecodealliance/wasi-rs,Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT,The Cranelift Project Developers
 wasite,https://github.com/ardaku/wasite,Apache-2.0 OR BSL-1.0 OR MIT,The wasite Authors
 wasm-bindgen,https://github.com/rustwasm/wasm-bindgen,MIT OR Apache-2.0,The wasm-bindgen Developers
 wasm-bindgen-backend,https://github.com/rustwasm/wasm-bindgen/tree/master/crates/backend,MIT OR Apache-2.0,The wasm-bindgen Developers
@@ -716,6 +714,7 @@ windows,https://github.com/microsoft/windows-rs,MIT OR Apache-2.0,Microsoft
 windows-service,https://github.com/mullvad/windows-service-rs,MIT OR Apache-2.0,Mullvad VPN
 winnow,https://github.com/winnow-rs/winnow,MIT,The winnow Authors
 winreg,https://github.com/gentoo90/winreg-rs,MIT,Igor Shaula <gentoo90@gmail.com>
+wit-bindgen-rt,https://github.com/bytecodealliance/wasi-rs,Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT,The wit-bindgen-rt Authors
 woothee,https://github.com/woothee/woothee-rust,Apache-2.0,hhatto <hhatto.jp@gmail.com>
 write16,https://github.com/hsivonen/write16,Apache-2.0 OR MIT,The write16 Authors
 writeable,https://github.com/unicode-org/icu4x,Unicode-3.0,The ICU4X Project Developers

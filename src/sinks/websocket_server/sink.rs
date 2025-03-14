@@ -126,13 +126,20 @@ impl WebSocketListenerSink {
         debug!("Incoming TCP connection from: {}", addr);
 
         let mut buffer_replay = BufferReplayRequest::NO_REPLAY;
-        let header_callback = |req: &Request, response: Response| {
+        let header_callback = |req: &Request, mut response: Response| {
             buffer_replay = message_buffering.extract_message_replay_request(req);
             let Some(auth) = auth else {
                 return Ok(response);
             };
             match auth.handle_auth(req.headers()) {
-                Ok(_) => Ok(response),
+                Ok(_) => {
+                    if let Some(websocket_protocol) = req.headers().get("Sec-WebSocket-Protocol") {
+                        response
+                            .headers_mut()
+                            .insert("Sec-WebSocket-Protocol", websocket_protocol.clone());
+                    }
+                    Ok(response)
+                }
                 Err(message) => {
                     let mut response = ErrorResponse::default();
                     *response.status_mut() = StatusCode::UNAUTHORIZED;

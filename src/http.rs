@@ -596,7 +596,7 @@ pub enum ParamType {
     /// The parameter value is a plain string.
     #[default]
     String,
-    /// The parameter value is a VRL expression that will be evaluated before each request.
+    /// The parameter value is a VRL expression that is evaluated before each request.
     Vrl,
 }
 
@@ -618,7 +618,7 @@ pub enum ParameterValue {
     Typed {
         /// The raw value of the parameter.
         value: String,
-        /// The type of the parameter, indicating how the `value` should be treated.
+        /// The parameter type, indicating how the `value` should be treated.
         #[serde(
             default,
             skip_serializing_if = "ParamType::is_default",
@@ -706,7 +706,7 @@ mod tests {
     use tower::ServiceBuilder;
 
     use super::*;
-    use crate::test_util::next_addr;
+    use crate::test_util::addr::next_addr;
 
     #[test]
     fn test_default_request_headers_defaults() {
@@ -894,7 +894,7 @@ mod tests {
     async fn test_max_connection_age_service_with_hyper_server() {
         // Create a hyper server with the max connection age layer.
         let max_connection_age = Duration::from_secs(1);
-        let addr = next_addr();
+        let (_guard, addr) = next_addr();
         let make_svc = make_service_fn(move |conn: &AddrStream| {
             let svc = ServiceBuilder::new()
                 .layer(MaxConnectionAgeLayer::new(

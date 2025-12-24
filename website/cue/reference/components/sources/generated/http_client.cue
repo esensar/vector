@@ -180,6 +180,38 @@ generated: components: sources: http_client: configuration: {
 			}
 		}
 	}
+	body: {
+		description: """
+			Raw data to send as the HTTP request body.
+
+			Can be a static string or a VRL expression.
+
+			When a body is provided, the `Content-Type` header is automatically set to
+			`application/json` unless explicitly overridden in the `headers` configuration.
+			"""
+		required: false
+		type: {
+			object: options: {
+				type: {
+					description: "The parameter type, indicating how the `value` should be treated."
+					required:    false
+					type: string: {
+						default: "string"
+						enum: {
+							string: "The parameter value is a plain string."
+							vrl:    "The parameter value is a VRL expression that is evaluated before each request."
+						}
+					}
+				}
+				value: {
+					description: "The raw value of the parameter."
+					required:    true
+					type: string: {}
+				}
+			}
+			string: {}
+		}
+	}
 	decoding: {
 		description: """
 			Configures how events are decoded from raw bytes. Note some decoders can also determine the event output
@@ -309,16 +341,34 @@ generated: components: sources: http_client: configuration: {
 				description:   "GELF-specific decoding options."
 				relevant_when: "codec = \"gelf\""
 				required:      false
-				type: object: options: lossy: {
-					description: """
-						Determines whether to replace invalid UTF-8 sequences instead of failing.
+				type: object: options: {
+					lossy: {
+						description: """
+																Determines whether to replace invalid UTF-8 sequences instead of failing.
 
-						When true, invalid UTF-8 sequences are replaced with the [`U+FFFD REPLACEMENT CHARACTER`][U+FFFD].
+																When true, invalid UTF-8 sequences are replaced with the [`U+FFFD REPLACEMENT CHARACTER`][U+FFFD].
 
-						[U+FFFD]: https://en.wikipedia.org/wiki/Specials_(Unicode_block)#Replacement_character
-						"""
-					required: false
-					type: bool: default: true
+																[U+FFFD]: https://en.wikipedia.org/wiki/Specials_(Unicode_block)#Replacement_character
+																"""
+						required: false
+						type: bool: default: true
+					}
+					validation: {
+						description: "Configures the decoding validation mode."
+						required:    false
+						type: string: {
+							default: "strict"
+							enum: {
+								relaxed: """
+																			Uses more relaxed validation that skips strict GELF specification checks.
+
+																			This mode will not treat specification violations as errors, allowing the decoder
+																			to accept messages from sources that don't strictly follow the GELF spec.
+																			"""
+								strict: "Uses strict validation that closely follows the GELF spec."
+							}
+						}
+					}
 				}
 			}
 			influxdb: {
@@ -732,13 +782,13 @@ generated: components: sources: http_client: configuration: {
 				type: {
 					object: options: {
 						type: {
-							description: "The type of the parameter, indicating how the `value` should be treated."
+							description: "The parameter type, indicating how the `value` should be treated."
 							required:    false
 							type: string: {
 								default: "string"
 								enum: {
 									string: "The parameter value is a plain string."
-									vrl:    "The parameter value is a VRL expression that will be evaluated before each request."
+									vrl:    "The parameter value is a VRL expression that is evaluated before each request."
 								}
 							}
 						}

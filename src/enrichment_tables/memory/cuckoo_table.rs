@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cuckoo_clock::{
     CuckooFilter,
-    config::{CuckooConfiguration, CustomDataConfig, LruConfig, TtlConfig},
+    config::{CounterConfig, CuckooConfiguration, LruConfig, TtlConfig},
 };
 use futures::{StreamExt, stream::BoxStream};
 use tokio::time::interval;
@@ -31,7 +31,6 @@ use crate::enrichment_tables::memory::{
 pub(super) struct CuckooMemoryTable {
     filter: CuckooFilter<RandomState>,
     pub(super) config: MemoryConfig,
-    counter_max_value: u32,
 }
 
 /// Configuration of cuckoo filter for memory table.
@@ -113,8 +112,9 @@ impl CuckooMemoryTable {
         }
 
         if cuckoo_config.counter_enabled {
-            builder = builder.with_custom(CustomDataConfig {
-                bits: cuckoo_config.counter_bits.get().try_into()?,
+            builder = builder.with_counter(CounterConfig {
+                counter_bits: cuckoo_config.counter_bits.get().try_into()?,
+                ..Default::default()
             });
         }
 
@@ -122,23 +122,12 @@ impl CuckooMemoryTable {
         Ok(Self {
             config,
             filter: CuckooFilter::new_random(built_config),
-            counter_max_value: (1 << cuckoo_config.counter_bits.get()) - 1u32,
         })
     }
 
     fn handle_value(&self, value: ObjectMap) {
         for (k, _) in value.iter() {
-            let _ = self.filter.insert_if_not_present(k, |data| {
-                // Increment our counter by one
-                let _ = data.modify_custom_data(|c| {
-                    let c = c + 1;
-                    if c >= self.counter_max_value {
-                        self.counter_max_value
-                    } else {
-                        c
-                    }
-                });
-            });
+            let _ = self.filter.insert_if_not_present(k);
         }
     }
 }
@@ -173,16 +162,7 @@ impl Table for CuckooMemoryTable {
             Some(_) if condition.len() > 1 => Err("Only one condition is allowed".to_string()),
             Some(Condition::Equals { value, .. }) => {
                 let key = value.to_string_lossy();
-                if let Some(associated_data) = self.filter.modify_and_get(&key, |data| {
-                    let _ = data.modify_custom_data(|c| {
-                        let c = c + 1;
-                        if c >= self.counter_max_value {
-                            self.counter_max_value
-                        } else {
-                            c
-                        }
-                    });
-                }) {
+                if let Some(associated_data) = self.filter.get_associated_data(&key) {
                     emit!(MemoryEnrichmentTableRead {
                         key: &key,
                         include_key_metric_tag: self.config.internal_metrics.include_key_tag
@@ -205,7 +185,7 @@ impl Table for CuckooMemoryTable {
                     {
                         result.insert(KeyString::from("ttl"), Value::Integer(ttl));
                     }
-                    if let Ok(counter) = associated_data.get_custom() {
+                    if let Ok(counter) = associated_data.get_counter() {
                         result.insert(KeyString::from("counter"), Value::Integer(counter.into()));
                     }
                     Ok(vec![result])

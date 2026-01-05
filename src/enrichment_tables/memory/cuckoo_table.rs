@@ -3,7 +3,7 @@ use std::{hash::RandomState, num::NonZeroUsize, time::Duration};
 use async_trait::async_trait;
 use bytes::Bytes;
 use cuckoo_clock::{
-    CuckooFilter,
+    CuckooFilter, InsertValues, LookupValues,
     config::{CounterConfig, CuckooConfiguration, LruConfig, TtlConfig},
 };
 use futures::{StreamExt, stream::BoxStream};
@@ -17,13 +17,18 @@ use vector_lib::{
     internal_event::{
         ByteSize, BytesSent, CountByteSize, EventsSent, InternalEventHandle, Output, Protocol,
     },
+    lookup::lookup_v2::OptionalValuePath,
     sink::StreamSink,
 };
 use vrl::value::{KeyString, ObjectMap, Value};
 
 use crate::enrichment_tables::memory::{
     MemoryConfig,
-    internal_events::{MemoryEnrichmentTableRead, MemoryEnrichmentTableReadFailed},
+    internal_events::{
+        MemoryEnrichmentTableFlushed, MemoryEnrichmentTableInserted, MemoryEnrichmentTableRead,
+        MemoryEnrichmentTableReadFailed, MemoryEnrichmentTableRemoved,
+        MemoryEnrichmentTableTtlExpiredCount,
+    },
 };
 
 /// A struct that implements [vector_lib::enrichment::Table] to handle loading enrichment data from a cuckoo table.
@@ -31,6 +36,7 @@ use crate::enrichment_tables::memory::{
 pub(super) struct CuckooMemoryTable {
     filter: CuckooFilter<RandomState>,
     pub(super) config: MemoryConfig,
+    cuckoo_config: CuckooMemoryConfig,
 }
 
 /// Configuration of cuckoo filter for memory table.
@@ -66,6 +72,10 @@ pub struct CuckooMemoryConfig {
     /// Number of bits to use to track counter. This will limit the max value.
     #[serde(default = "default_cuckoo_counter_bits")]
     pub counter_bits: NonZeroUsize,
+    /// Field in the incoming value used as the counter override.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub counter_field: OptionalValuePath,
 }
 
 const fn default_cuckoo_fingerprint_bits() -> NonZeroUsize {
@@ -122,12 +132,57 @@ impl CuckooMemoryTable {
         Ok(Self {
             config,
             filter: CuckooFilter::new_random(built_config),
+            cuckoo_config,
         })
     }
 
     fn handle_value(&self, value: ObjectMap) {
-        for (k, _) in value.iter() {
-            let _ = self.filter.insert_if_not_present(k);
+        for (k, value) in value.iter() {
+            if matches!(value, Value::Null) {
+                if self.filter.remove(k) {
+                    emit!(MemoryEnrichmentTableRemoved {
+                        key: k,
+                        include_key_metric_tag: self.config.internal_metrics.include_key_tag
+                    });
+                }
+
+                continue;
+            };
+
+            if self.cuckoo_config.ttl_enabled || self.cuckoo_config.counter_enabled {
+                let ttl = self
+                    .config
+                    .ttl_field
+                    .path
+                    .as_ref()
+                    .and_then(|p| value.get(p))
+                    .and_then(|v| v.as_integer())
+                    .and_then(|v| u64::try_from(v).ok())
+                    .map(|v| v / self.config.scan_interval.get())
+                    .and_then(|v| u32::try_from(v).ok());
+                let counter = self
+                    .cuckoo_config
+                    .counter_field
+                    .path
+                    .as_ref()
+                    .and_then(|p| value.get(p))
+                    .and_then(|v| v.as_integer())
+                    .and_then(|v| i32::try_from(v).ok());
+                let _ = self.filter.insert_if_not_present_with_update(
+                    k,
+                    InsertValues { ttl, counter },
+                    LookupValues {
+                        ttl,
+                        counter_diff: counter,
+                    },
+                );
+            } else {
+                let _ = self.filter.insert_if_not_present(k);
+            }
+            emit!(MemoryEnrichmentTableInserted {
+                key: k,
+                include_key_metric_tag: self.config.internal_metrics.include_key_tag
+            });
         }
     }
 }
@@ -235,6 +290,12 @@ impl StreamSink<Event> for CuckooMemoryTable {
         let mut scan_interval = IntervalStream::new(interval(Duration::from_secs(
             self.config.scan_interval.into(),
         )));
+        let mut flush_interval = IntervalStream::new(interval(
+            self.config
+                .flush_interval
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::MAX),
+        ));
 
         loop {
             tokio::select! {
@@ -260,8 +321,18 @@ impl StreamSink<Event> for CuckooMemoryTable {
                     bytes_sent.emit(ByteSize(event_byte_size.get()));
                 },
 
+                Some(_) = flush_interval.next() => {
+                    emit!(MemoryEnrichmentTableFlushed {
+                        new_objects_count: self.filter.get_item_count(),
+                        new_byte_size: self.filter.get_memory_usage()
+                    });
+                }
+
                 Some(_) = scan_interval.next() => {
-                    self.filter.scan_and_update_full();
+                    let expired = self.filter.scan_and_update_full();
+                    emit!(MemoryEnrichmentTableTtlExpiredCount {
+                        count: expired as u64
+                    });
                 }
             }
         }

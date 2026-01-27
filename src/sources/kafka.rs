@@ -606,7 +606,7 @@ impl ConsumerStateInner<Consuming> {
         out: SourceSender,
         log_namespace: LogNamespace,
         span: Span,
-        active_parsing_tasks_num: Arc<AtomicUsize>,
+        active_message_handling_tasks: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             config,
@@ -615,7 +615,7 @@ impl ConsumerStateInner<Consuming> {
             log_namespace,
             consumer_state: Consuming {
                 span,
-                active_message_handling_tasks: active_parsing_tasks_num,
+                active_message_handling_tasks,
             },
         }
     }

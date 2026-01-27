@@ -373,8 +373,6 @@ jobs:
       - build-x86_64-unknown-linux-musl-packages
       - build-aarch64-unknown-linux-musl-packages
       - build-aarch64-unknown-linux-gnu-packages
-      - build-apple-darwin-packages
-      - build-x86_64-pc-windows-msvc-packages
       - build-armv7-unknown-linux-gnueabihf-packages
       - build-armv7-unknown-linux-musleabihf-packages
       - build-arm-unknown-linux-gnueabi-packages
@@ -405,16 +403,6 @@ jobs:
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: vector-${{ env.VECTOR_VERSION }}-x86_64-unknown-linux-musl
-          path: target/artifacts
-      - name: Download staged package artifacts (arm64-apple-darwin)
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: vector-${{ env.VECTOR_VERSION }}-arm64-apple-darwin
-          path: target/artifacts
-      - name: Download staged package artifacts (x86_64-pc-windows-msvc)
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: vector-${{ env.VECTOR_VERSION }}-x86_64-pc-windows-msvc
           path: target/artifacts
       - name: Download staged package artifacts (armv7-unknown-linux-gnueabihf)
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0

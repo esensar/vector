@@ -4,6 +4,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, OnceLock, Weak,
+        atomic::{AtomicUsize, Ordering},
         mpsc::{SyncSender, sync_channel},
     },
     time::Duration,
@@ -12,7 +13,7 @@ use std::{
 use async_stream::stream;
 use bytes::Bytes;
 use chrono::{DateTime, TimeZone, Utc};
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, stream::FuturesOrdered};
 use futures_util::future::OptionFuture;
 use rdkafka::{
     ClientConfig, ClientContext, Statistics, Timestamp, TopicPartitionList,
@@ -21,7 +22,7 @@ use rdkafka::{
         stream_consumer::StreamPartitionQueue,
     },
     error::KafkaError,
-    message::{BorrowedHeaders, BorrowedMessage, Headers as _, Message, OwnedHeaders},
+    message::{Headers as _, Message, OwnedMessage},
     types::RDKafkaErrorCode,
 };
 use serde_with::serde_as;
@@ -32,7 +33,7 @@ use tokio::{
         mpsc::{self, UnboundedReceiver, UnboundedSender},
         oneshot,
     },
-    task::JoinSet,
+    task::{JoinHandle, JoinSet},
     time::Sleep,
 };
 use tracing::{Instrument, Span};
@@ -217,6 +218,14 @@ pub struct KafkaSourceConfig {
     #[configurable(metadata(docs::examples = "headers"))]
     headers_key: OptionalValuePath,
 
+    /// Configuration for multithreaded message processing.
+    ///
+    /// By default, multithreaded message processing is disabled.
+    #[configurable(derived)]
+    #[configurable(metadata(docs::advanced))]
+    #[serde(default)]
+    multithreading: Option<MultithreadingConfig>,
+
     /// Advanced options set directly on the underlying `librdkafka` client.
     ///
     /// See the [librdkafka documentation](https://github.com/edenhill/librdkafka/blob/master/CONFIGURATION.md) for details.
@@ -261,6 +270,16 @@ impl KafkaSourceConfig {
     }
 }
 
+/// Configuration for multithreading for the `kafka` source.
+#[configurable_component]
+#[derive(Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct MultithreadingConfig {
+    /// Number of messages may be processed in parallel for message processing.
+    #[serde(default = "default_max_message_handling_tasks")]
+    max_message_handling_tasks: usize,
+}
+
 const fn default_session_timeout_ms() -> Duration {
     Duration::from_millis(10000) // default in librdkafka
 }
@@ -275,6 +294,10 @@ const fn default_fetch_wait_max_ms() -> Duration {
 
 const fn default_commit_interval_ms() -> Duration {
     Duration::from_millis(5000)
+}
+
+const fn default_max_message_handling_tasks() -> usize {
+    4
 }
 
 fn default_auto_offset_reset() -> String {
@@ -455,8 +478,14 @@ async fn kafka_source(
         let drain_timeout_ms = config
             .drain_timeout_ms
             .map_or(config.session_timeout_ms / 2, Duration::from_millis);
-        let consumer_state =
-            ConsumerStateInner::<Consuming>::new(config, decoder, out, log_namespace, span);
+        let consumer_state = ConsumerStateInner::<Consuming>::new(
+            config,
+            decoder,
+            out,
+            log_namespace,
+            span,
+            Arc::new(AtomicUsize::new(0)),
+        );
         tokio::spawn(async move {
             coordinate_kafka_callbacks(
                 consumer,
@@ -510,6 +539,10 @@ struct ConsumerStateInner<S> {
 struct Consuming {
     /// The source's tracing Span used to instrument metrics emitted by consumer tasks
     span: Span,
+
+    /// Number of currently active message parsing tasks.
+    /// Used in multithreaded mode.
+    active_message_handling_tasks: Arc<AtomicUsize>,
 }
 struct Draining {
     /// The rendezvous channel sender from the revoke or shutdown callback. Sending on this channel
@@ -530,6 +563,11 @@ struct Draining {
     /// a Consuming state.
     shutdown: bool,
 
+    /// Number of currently active message parsing tasks.
+    /// Used in multithreaded mode.
+    /// Needed if Consuming state is to be returned.
+    active_message_handling_tasks: Arc<AtomicUsize>,
+
     /// The source's tracing Span used to instrument metrics emitted by consumer tasks
     span: Span,
 }
@@ -546,6 +584,7 @@ impl Draining {
             shutdown,
             expect_drain: HashSet::new(),
             span: state.span,
+            active_message_handling_tasks: state.active_message_handling_tasks,
         }
     }
 
@@ -567,13 +606,17 @@ impl ConsumerStateInner<Consuming> {
         out: SourceSender,
         log_namespace: LogNamespace,
         span: Span,
+        active_parsing_tasks_num: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             config,
             decoder,
             out,
             log_namespace,
-            consumer_state: Consuming { span },
+            consumer_state: Consuming {
+                span,
+                active_message_handling_tasks: active_parsing_tasks_num,
+            },
         }
     }
 
@@ -596,10 +639,16 @@ impl ConsumerStateInner<Consuming> {
         let mut out = self.out.clone();
 
         let (end_tx, mut end_signal) = oneshot::channel::<()>();
+        let multithreading_config = self.config.multithreading.clone();
+        let active_message_handling_tasks =
+            Arc::clone(&self.consumer_state.active_message_handling_tasks);
+
+        let span = self.consumer_state.span.clone();
 
         let handle = join_set.spawn(async move {
             let mut messages = p.stream().ready_chunks(CHUNK_SIZE);
             let (finalizer, mut ack_stream) = OrderedFinalizer::<FinalizerEntry>::new(None);
+            let mut processing_futures = FuturesOrdered::<JoinHandle<Option<(OwnedMessage, BatchStatusReceiver)>>>::new();
 
             // finalizer is the entry point for new pending acknowledgements;
             // when it is dropped, no new messages will be consumed, and the
@@ -638,33 +687,38 @@ impl ConsumerStateInner<Consuming> {
 
                     message = messages.next(), if finalizer.is_some() => match message {
                         None => unreachable!("MessageStream never calls Ready(None)"),
-                        Some(msgs) => {
-                            let (oks, errors): (Vec<_>, Vec<_>) = msgs.into_iter().partition(Result::is_ok);
-                            let oks: Vec<_> = oks.into_iter().map(Result::unwrap).collect();
-                            let errors: Vec<_> = errors.into_iter().map(Result::unwrap_err).collect();
-
-                            // Detach messages from rdkafka early - this duplicates some memory,
-                            // but is needed for multithreading. Parsing has to copy data
-                            // anyways, so it just takes data from the detached message.
-                            let msgs = oks.into_iter().filter_map(|b|
-                                // The only case TryInto will fail if the message is empty
-                                // And we want to ignore empty messages
-                                b.try_into().ok()
-                            ).collect();
-                            let batch_result = parse_message(msgs, &decoder, &keys, &mut out, acknowledgements, log_namespace).await;
-                            Self::finalize_batch(batch_result, finalizer.as_ref());
-
-                            for error in errors  {
-                                match error {
-                                    rdkafka::error::KafkaError::PartitionEOF(partition) if exit_eof => {
-                                        debug!("EOF for partition {}.", partition);
-                                        status = PartitionConsumerStatus::PartitionEOF;
-                                        finalizer.take();
-                                    },
-                                    _ => emit!(KafkaReadError { error }),
+                        Some(msgs) => match msgs.into_iter().collect::<Result<Vec<_>, _>>() {
+                            Err(error) => match error {
+                                rdkafka::error::KafkaError::PartitionEOF(partition) if exit_eof => {
+                                    debug!("EOF for partition {}.", partition);
+                                    status = PartitionConsumerStatus::PartitionEOF;
+                                    finalizer.take();
+                                },
+                                _ => emit!(KafkaReadError { error }),
+                            },
+                            Ok(msg) => {
+                                let msg = msg.into_iter().map(|b| b.detach()).collect();
+                                if let Some(multithreading) = &multithreading_config {
+                                    let decoder = decoder.clone();
+                                    let keys = keys.clone();
+                                    let mut out = out.clone();
+                                    let active_message_handling_tasks = Arc::clone(&active_message_handling_tasks);
+                                    Self::wait_for_task_quota(multithreading, &active_message_handling_tasks).await;
+                                    processing_futures.push_back(tokio::spawn(async move {
+                                        let result = parse_message(msg, &decoder, &keys, &mut out, acknowledgements, log_namespace).await;
+                                        active_message_handling_tasks.fetch_sub(1, Ordering::AcqRel);
+                                        result
+                                    }.instrument(span.clone())));
+                                } else {
+                                    let batch_result = parse_message(msg, &decoder, &keys, &mut out, acknowledgements, log_namespace).await;
+                                    Self::finalize_batch(batch_result, finalizer.as_ref());
                                 }
                             }
                         }
+                    },
+
+                    res = processing_futures.next(), if finalizer.is_some() => if let Some(Ok(batch_result)) = res {
+                        Self::finalize_batch(batch_result, finalizer.as_ref());
                     },
                 )
             }
@@ -707,6 +761,15 @@ impl ConsumerStateInner<Consuming> {
         {
             f.add(msg.into(), receiver);
         }
+    }
+
+    async fn wait_for_task_quota(config: &MultithreadingConfig, active_tasks: &Arc<AtomicUsize>) {
+        while config.max_message_handling_tasks > 0
+            && config.max_message_handling_tasks < active_tasks.load(Ordering::Acquire)
+        {
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        active_tasks.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -751,6 +814,9 @@ impl ConsumerStateInner<Draining> {
                     log_namespace: self.log_namespace,
                     consumer_state: Consuming {
                         span: self.consumer_state.span,
+                        active_message_handling_tasks: self
+                            .consumer_state
+                            .active_message_handling_tasks,
                     },
                 }),
             )
@@ -981,18 +1047,17 @@ async fn parse_message(
 ) -> Option<(OwnedMessage, BatchStatusReceiver)> {
     let (batch, receiver) = BatchNotifier::new_with_receiver();
     let last = messages.last().cloned()?;
-    let size = messages.len();
     let (count, streams) = messages
-        .into_iter()
+        .iter()
         .filter_map(|msg| parse_stream(msg, decoder.clone(), keys, log_namespace))
         .fold(
-            (0usize, Vec::with_capacity(size)),
+            (0usize, Vec::with_capacity(messages.len())),
             |(lc, mut ls), (rc, rs)| {
                 ls.push(rs);
                 (lc + rc, ls)
             },
         );
-    let mut batch_stream = futures::stream::iter(streams).flatten().map(|event| {
+    let mut batch_stream = futures::stream::select_all(streams).map(|event| {
         // All acknowledgements flow through the normal Finalizer stream so
         // that they can be handled in one place, but are only tied to the
         // batch when acknowledgements are enabled
@@ -1013,7 +1078,7 @@ async fn parse_message(
 
 // Turn the received message into a stream of parsed events.
 fn parse_stream<'a>(
-    msg: OwnedMessage,
+    msg: &OwnedMessage,
     decoder: Decoder,
     keys: &'a Keys,
     log_namespace: LogNamespace,
@@ -1027,9 +1092,18 @@ fn parse_stream<'a>(
     });
     let rmsg = ReceivedMessage::from(&msg);
 
-    let payload = Cursor::new(Bytes::from_owner(msg.payload));
+    let size = payload.len();
+    emit!(KafkaBytesReceived {
+        byte_size: size,
+        protocol: "tcp",
+        topic: msg.topic(),
+        partition: msg.partition(),
+    });
+    let rmsg = ReceivedMessage::from(msg);
 
-    let mut stream = DecoderFramedRead::with_capacity(payload, decoder, size);
+    let payload = Cursor::new(Bytes::copy_from_slice(payload));
+
+    let mut stream = FramedRead::with_capacity(payload, decoder, size);
     let (count, _) = stream.size_hint();
     let stream = stream! {
         while let Some(result) = stream.next().await {

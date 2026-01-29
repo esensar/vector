@@ -13,6 +13,7 @@ use cuckoo_clock::{
     config::{CounterConfig, CuckooConfiguration, LruConfig, TtlConfig},
 };
 use futures::{StreamExt, stream::BoxStream};
+use tempfile::NamedTempFile;
 use tokio::time::interval;
 use tokio_stream::wrappers::IntervalStream;
 use vector_config::configurable_component;
@@ -183,23 +184,49 @@ impl CuckooMemoryTable {
 
     fn export(&self) {
         if let Some(path) = &self.cuckoo_config.persistence_path {
-            let Ok(file) = File::create(path) else {
-                warn!(
-                    "Couldn't open \"{}\" for cuckoo filter state export.",
-                    path.to_str().unwrap_or("")
-                );
-                return;
-            };
-            let mut writer = BufWriter::new(file);
-            match self.filter.exporter().read_into(&mut writer) {
-                Ok(()) => {
-                    if let Err(error) = writer.flush() {
-                        warn!("Cuckoo filter export failed: {}", error);
-                    };
+            let mut parent = path.clone();
+            if parent.pop()
+                && let Ok(temp) = NamedTempFile::new_in(parent)
+            {
+                {
+                    let mut writer = BufWriter::new(temp.as_file());
+                    if self.export_to(&mut writer).is_err() {
+                        return;
+                    }
                 }
-                Err(error) => {
+                if let Err(error) = temp.persist(path) {
                     warn!("Cuckoo filter export failed: {}", error);
                 }
+            } else {
+                warn!(
+                    "Couldn't open temporary file for export. Trying to write directly to \"{}\"",
+                    path.to_str().unwrap_or("")
+                );
+                let Ok(file) = File::create(path) else {
+                    warn!(
+                        "Couldn't open \"{}\" for cuckoo filter state export.",
+                        path.to_str().unwrap_or("")
+                    );
+                    return;
+                };
+                let mut writer = BufWriter::new(file);
+                let _ = self.export_to(&mut writer);
+            };
+        }
+    }
+
+    fn export_to(&self, mut writer: impl Write) -> Result<(), ()> {
+        match self.filter.exporter().read_into(&mut writer) {
+            Ok(()) => {
+                if let Err(error) = writer.flush() {
+                    warn!("Cuckoo filter export failed: {}", error);
+                    return Err(());
+                };
+                Ok(())
+            }
+            Err(error) => {
+                warn!("Cuckoo filter export failed: {}", error);
+                Err(())
             }
         }
     }

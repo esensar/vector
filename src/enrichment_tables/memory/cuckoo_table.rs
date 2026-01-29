@@ -1,9 +1,15 @@
-use std::{hash::RandomState, num::NonZeroUsize, time::Duration};
+use std::{
+    fs::File,
+    io::{BufReader, BufWriter, Write},
+    num::NonZeroUsize,
+    path::PathBuf,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use cuckoo_clock::{
-    CuckooFilter, InsertValues, LookupValues,
+    CuckooFilter, ExportableRandomState, InsertValues, LookupValues,
     config::{CounterConfig, CuckooConfiguration, LruConfig, TtlConfig},
 };
 use futures::{StreamExt, stream::BoxStream};
@@ -34,7 +40,7 @@ use crate::enrichment_tables::memory::{
 /// A struct that implements [vector_lib::enrichment::Table] to handle loading enrichment data from a cuckoo table.
 #[derive(Clone)]
 pub(super) struct CuckooMemoryTable {
-    filter: CuckooFilter<RandomState>,
+    filter: CuckooFilter<ExportableRandomState>,
     pub(super) config: MemoryConfig,
     cuckoo_config: CuckooMemoryConfig,
 }
@@ -76,6 +82,11 @@ pub struct CuckooMemoryConfig {
     #[configurable(derived)]
     #[serde(default)]
     pub counter_field: OptionalValuePath,
+    /// Path to the file to export data to periodically and on exit.
+    /// Data will be imported from this file on startup.
+    #[configurable(derived)]
+    #[serde(default)]
+    pub persistence_path: Option<PathBuf>,
 }
 
 const fn default_cuckoo_fingerprint_bits() -> NonZeroUsize {
@@ -129,11 +140,68 @@ impl CuckooMemoryTable {
         }
 
         let built_config = builder.build()?;
+
+        let filter = 'import: {
+            if let Some(path) = &cuckoo_config.persistence_path {
+                let Ok(file) = File::open(path) else {
+                    warn!(
+                        "Couldn't open \"{}\" for cuckoo filter state import.",
+                        path.to_str().unwrap_or("")
+                    );
+                    break 'import CuckooFilter::new_random_exportable(built_config);
+                };
+                let mut reader = BufReader::new(file);
+                let filter = match CuckooFilter::import_random_exportable(&mut reader) {
+                    Ok(filter) => filter,
+                    Err(error) => {
+                        warn!("Cuckoo filter state import failed: {}", error);
+                        break 'import CuckooFilter::new_random_exportable(built_config);
+                    }
+                };
+
+                if filter.get_configuration() != built_config {
+                    // TODO: Should this stop the build from succeeding? The import will be lost,
+                    // because it will be overwritter very soon.
+                    warn!(
+                        "Stored cuckoo filter configuration doesn't match with new configuration. Ignoring the import.",
+                    );
+                    break 'import CuckooFilter::new_random_exportable(built_config);
+                }
+
+                filter
+            } else {
+                CuckooFilter::new_random_exportable(built_config)
+            }
+        };
+
         Ok(Self {
             config,
-            filter: CuckooFilter::new_random(built_config),
+            filter,
             cuckoo_config,
         })
+    }
+
+    fn export(&self) {
+        if let Some(path) = &self.cuckoo_config.persistence_path {
+            let Ok(file) = File::create(path) else {
+                warn!(
+                    "Couldn't open \"{}\" for cuckoo filter state export.",
+                    path.to_str().unwrap_or("")
+                );
+                return;
+            };
+            let mut writer = BufWriter::new(file);
+            match self.filter.exporter().read_into(&mut writer) {
+                Ok(()) => {
+                    if let Err(error) = writer.flush() {
+                        warn!("Cuckoo filter export failed: {}", error);
+                    };
+                }
+                Err(error) => {
+                    warn!("Cuckoo filter export failed: {}", error);
+                }
+            }
+        }
     }
 
     fn handle_value(&self, value: ObjectMap) {
@@ -326,6 +394,7 @@ impl StreamSink<Event> for CuckooMemoryTable {
                         new_objects_count: self.filter.get_item_count(),
                         new_byte_size: self.filter.get_memory_usage()
                     });
+                    self.export();
                 }
 
                 Some(_) = scan_interval.next() => {
@@ -336,6 +405,10 @@ impl StreamSink<Event> for CuckooMemoryTable {
                 }
             }
         }
+
+        // Final export before exiting
+        self.export();
+
         Ok(())
     }
 }

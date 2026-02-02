@@ -88,6 +88,11 @@ pub struct CuckooMemoryConfig {
     #[configurable(derived)]
     #[serde(default)]
     pub persistence_path: Option<PathBuf>,
+    /// The interval used for exporting data.
+    ///
+    /// By default, export is only done on exit.
+    #[serde(skip_serializing_if = "vector_lib::serde::is_default")]
+    pub export_interval: Option<u64>,
 }
 
 const fn default_cuckoo_fingerprint_bits() -> NonZeroUsize {
@@ -391,6 +396,12 @@ impl StreamSink<Event> for CuckooMemoryTable {
                 .map(Duration::from_secs)
                 .unwrap_or(Duration::MAX),
         ));
+        let mut export_interval = IntervalStream::new(interval(
+            self.cuckoo_config
+                .export_interval
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::MAX),
+        ));
 
         loop {
             tokio::select! {
@@ -421,6 +432,9 @@ impl StreamSink<Event> for CuckooMemoryTable {
                         new_objects_count: self.filter.get_item_count(),
                         new_byte_size: self.filter.get_memory_usage()
                     });
+                }
+
+                Some(_) = export_interval.next() => {
                     self.export();
                 }
 

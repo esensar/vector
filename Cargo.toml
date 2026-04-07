@@ -151,7 +151,7 @@ clap_complete = "4.5.65"
 colored = { version = "3.0.0", default-features = false }
 const-str = { version = "1.0.0", default-features = false }
 crossbeam-utils = { version = "0.8.21", default-features = false }
-cuckoo-clock = { path = "lib/cuckoo-clock" , default-features = false }
+cuckoo-clock = { version = "0.1.0" , default-features = false }
 darling = { version = "0.20.11", default-features = false, features = ["suggestions"] }
 dashmap = { version = "6.1.0", default-features = false }
 derivative = { version = "2.2.0", default-features = false }

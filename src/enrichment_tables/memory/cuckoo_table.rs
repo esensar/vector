@@ -221,7 +221,7 @@ impl CuckooMemoryTable {
     }
 
     fn export_to(&self, mut writer: impl Write) -> Result<(), ()> {
-        match self.filter.exporter().read_into(&mut writer) {
+        match self.filter.exporter().write_to(&mut writer) {
             Ok(()) => {
                 if let Err(error) = writer.flush() {
                     warn!("Cuckoo filter export failed: {}", error);
